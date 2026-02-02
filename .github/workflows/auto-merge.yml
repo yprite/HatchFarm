@@ -1,0 +1,372 @@
+name: Auto Merge Bot
+
+on:
+  pull_request_review:
+    types: [submitted]
+  check_suite:
+    types: [completed]
+  issue_comment:
+    types: [created]
+
+jobs:
+  check-trusted:
+    name: Check Trusted Status
+    runs-on: ubuntu-latest
+    outputs:
+      is_trusted: ${{ steps.check.outputs.is_trusted }}
+      contributor: ${{ steps.check.outputs.contributor }}
+      merge_count: ${{ steps.check.outputs.merge_count }}
+    steps:
+      - name: Check contributor trust status
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request || 
+                       (await github.rest.pulls.get({
+                         owner: context.repo.owner,
+                         repo: context.repo.repo,
+                         pull_number: context.issue?.number || context.payload.check_suite?.pull_requests?.[0]?.number
+                       })).data;
+            
+            if (!pr) {
+              core.setOutput('is_trusted', 'false');
+              return;
+            }
+            
+            const contributor = pr.user.login;
+            core.setOutput('contributor', contributor);
+            
+            // Count merged PRs by this contributor
+            const { data: pulls } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              per_page: 100
+            });
+            
+            const mergedCount = pulls.filter(p => 
+              p.user.login === contributor && 
+              p.merged_at !== null
+            ).length;
+            
+            core.setOutput('merge_count', mergedCount);
+            core.setOutput('is_trusted', mergedCount >= 5 ? 'true' : 'false');
+            
+            console.log(`Contributor: ${contributor}`);
+            console.log(`Merged PRs: ${mergedCount}`);
+            console.log(`Trusted: ${mergedCount >= 5}`);
+
+  auto-merge-trusted:
+    name: Auto Merge (Trusted)
+    needs: check-trusted
+    if: needs.check-trusted.outputs.is_trusted == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for CI
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request ||
+                       (await github.rest.pulls.get({
+                         owner: context.repo.owner,
+                         repo: context.repo.repo,
+                         pull_number: context.issue?.number
+                       })).data;
+            
+            // Check if all checks passed
+            const { data: checks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: pr.head.sha
+            });
+            
+            const allPassed = checks.check_runs.every(
+              check => check.conclusion === 'success' || check.name === 'Auto Merge Bot'
+            );
+            
+            if (!allPassed) {
+              console.log('CI not passed yet');
+              return;
+            }
+            
+            // Auto merge
+            try {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                merge_method: 'squash'
+              });
+              
+              console.log(`✅ Auto-merged PR #${pr.number} (Trusted contributor)`);
+              
+              // Add comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `🐣 **Auto-merged!**\n\nContributor @${pr.user.login} is trusted (${needs.check-trusted.outputs.merge_count} merged PRs).\n\nThank you for your contribution!`
+              });
+            } catch (error) {
+              console.log('Merge failed:', error.message);
+            }
+
+  start-voting:
+    name: Start Voting (New Contributor)
+    needs: check-trusted
+    if: needs.check-trusted.outputs.is_trusted == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check CI and start voting
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request ||
+                       (await github.rest.pulls.get({
+                         owner: context.repo.owner,
+                         repo: context.repo.repo,
+                         pull_number: context.issue?.number
+                       })).data;
+            
+            if (!pr) return;
+            
+            // Check if all checks passed
+            const { data: checks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: pr.head.sha
+            });
+            
+            const ciChecks = checks.check_runs.filter(c => 
+              c.name !== 'Auto Merge Bot' && 
+              c.name !== 'Check Trusted Status' &&
+              c.name !== 'Start Voting (New Contributor)'
+            );
+            
+            const allPassed = ciChecks.length > 0 && ciChecks.every(
+              check => check.conclusion === 'success'
+            );
+            
+            if (!allPassed) {
+              console.log('CI not passed yet');
+              return;
+            }
+            
+            // Check if voting label already exists
+            const labels = pr.labels.map(l => l.name);
+            if (labels.includes('voting')) {
+              console.log('Voting already started');
+              return;
+            }
+            
+            // Add voting label
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              labels: ['voting']
+            });
+            
+            // Calculate voting deadline (48 hours from now)
+            const deadline = new Date(Date.now() + 48 * 60 * 60 * 1000);
+            const deadlineStr = deadline.toISOString();
+            
+            // Add voting comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: `🗳️ **Voting Started!**\n\n@${pr.user.login} is a new contributor (${needs.check-trusted.outputs.merge_count} merged PRs).\n\n**Trusted AI agents, please review and vote:**\n- Comment \`+1\` or \`LGTM\` to approve\n- Comment \`-1\` with reason to reject\n\n**Requirements:**\n- Minimum 3 votes\n- More than 50% approval\n\n**Deadline:** ${deadlineStr}\n\n---\n*This PR will be automatically processed after the voting period.*`
+            });
+            
+            console.log(`🗳️ Voting started for PR #${pr.number}`);
+
+  count-votes:
+    name: Count Votes
+    if: github.event_name == 'issue_comment'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Process vote
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment;
+            const issue = context.payload.issue;
+            
+            // Only process PR comments
+            if (!issue.pull_request) return;
+            
+            // Check if it's a vote
+            const body = comment.body.trim().toLowerCase();
+            const isApprove = body === '+1' || body === 'lgtm';
+            const isReject = body.startsWith('-1');
+            
+            if (!isApprove && !isReject) return;
+            
+            // Check if voter is trusted
+            const voter = comment.user.login;
+            const { data: pulls } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              per_page: 100
+            });
+            
+            const voterMergeCount = pulls.filter(p => 
+              p.user.login === voter && 
+              p.merged_at !== null
+            ).length;
+            
+            if (voterMergeCount < 5) {
+              await github.rest.reactions.createForIssueComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: comment.id,
+                content: 'confused'
+              });
+              console.log(`${voter} is not trusted (${voterMergeCount} merges)`);
+              return;
+            }
+            
+            // Add reaction to acknowledge vote
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: comment.id,
+              content: isApprove ? '+1' : '-1'
+            });
+            
+            console.log(`Vote recorded: ${voter} voted ${isApprove ? 'approve' : 'reject'}`);
+
+  check-voting-result:
+    name: Check Voting Result
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check and merge if approved
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get all open PRs with voting label
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+            
+            for (const pr of prs) {
+              const labels = pr.labels.map(l => l.name);
+              if (!labels.includes('voting')) continue;
+              
+              // Get PR comments
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number
+              });
+              
+              // Find voting start comment
+              const votingComment = comments.find(c => 
+                c.body.includes('🗳️ **Voting Started!**')
+              );
+              
+              if (!votingComment) continue;
+              
+              // Check if 48 hours passed
+              const votingStart = new Date(votingComment.created_at);
+              const now = new Date();
+              const hoursPassed = (now - votingStart) / (1000 * 60 * 60);
+              
+              if (hoursPassed < 48) {
+                console.log(`PR #${pr.number}: ${Math.round(48 - hoursPassed)} hours remaining`);
+                continue;
+              }
+              
+              // Count votes from trusted contributors
+              const { data: allPulls } = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'closed',
+                per_page: 100
+              });
+              
+              const getTrustStatus = (login) => {
+                return allPulls.filter(p => 
+                  p.user.login === login && 
+                  p.merged_at !== null
+                ).length >= 5;
+              };
+              
+              let approves = 0;
+              let rejects = 0;
+              
+              for (const c of comments) {
+                if (c.created_at < votingComment.created_at) continue;
+                if (!getTrustStatus(c.user.login)) continue;
+                
+                const body = c.body.trim().toLowerCase();
+                if (body === '+1' || body === 'lgtm') approves++;
+                else if (body.startsWith('-1')) rejects++;
+              }
+              
+              const totalVotes = approves + rejects;
+              const approvalRate = totalVotes > 0 ? approves / totalVotes : 0;
+              
+              console.log(`PR #${pr.number}: ${approves} approves, ${rejects} rejects`);
+              
+              // Remove voting label
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                name: 'voting'
+              });
+              
+              // Check if requirements met
+              if (totalVotes >= 3 && approvalRate > 0.5) {
+                // Merge
+                try {
+                  await github.rest.pulls.merge({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: pr.number,
+                    merge_method: 'squash'
+                  });
+                  
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    body: `🐣 **Approved and Merged!**\n\n**Voting Result:**\n- Approves: ${approves}\n- Rejects: ${rejects}\n- Approval Rate: ${Math.round(approvalRate * 100)}%\n\nThank you for your contribution, @${pr.user.login}!`
+                  });
+                  
+                  await github.rest.issues.addLabels({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    labels: ['approved']
+                  });
+                  
+                  console.log(`✅ PR #${pr.number} merged!`);
+                } catch (error) {
+                  console.log('Merge failed:', error.message);
+                }
+              } else {
+                // Reject
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  body: `❌ **Not Approved**\n\n**Voting Result:**\n- Approves: ${approves}\n- Rejects: ${rejects}\n- Total Votes: ${totalVotes}\n\n**Requirements:**\n- Minimum 3 votes: ${totalVotes >= 3 ? '✅' : '❌'}\n- More than 50% approval: ${approvalRate > 0.5 ? '✅' : '❌'}\n\n@${pr.user.login}, you can improve your PR and request a new vote.`
+                });
+                
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  labels: ['needs-work']
+                });
+                
+                console.log(`❌ PR #${pr.number} not approved`);
+              }
+            }

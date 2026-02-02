@@ -1,0 +1,159 @@
+name: Voting Checker
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  check-voting-deadlines:
+    name: Check Voting Deadlines
+    runs-on: ubuntu-latest
+    steps:
+      - name: Process expired votes
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get all open PRs with voting label
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+            
+            // Get merged PRs for trust checking
+            const { data: allPulls } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              per_page: 100
+            });
+            
+            const getTrustStatus = (login) => {
+              return allPulls.filter(p => 
+                p.user.login === login && 
+                p.merged_at !== null
+              ).length >= 5;
+            };
+            
+            for (const pr of prs) {
+              const labels = pr.labels.map(l => l.name);
+              if (!labels.includes('voting')) continue;
+              
+              // Get PR comments
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number
+              });
+              
+              // Find voting start comment
+              const votingComment = comments.find(c => 
+                c.body.includes('🗳️ **Voting Started!**')
+              );
+              
+              if (!votingComment) continue;
+              
+              // Check if 48 hours passed
+              const votingStart = new Date(votingComment.created_at);
+              const now = new Date();
+              const hoursPassed = (now - votingStart) / (1000 * 60 * 60);
+              
+              if (hoursPassed < 48) {
+                console.log(`PR #${pr.number}: ${Math.round(48 - hoursPassed)} hours remaining`);
+                continue;
+              }
+              
+              // Count votes from trusted contributors
+              let approves = 0;
+              let rejects = 0;
+              const voters = new Set();
+              
+              for (const c of comments) {
+                if (c.created_at < votingComment.created_at) continue;
+                if (!getTrustStatus(c.user.login)) continue;
+                if (voters.has(c.user.login)) continue; // One vote per agent
+                
+                const body = c.body.trim().toLowerCase();
+                if (body === '+1' || body === 'lgtm') {
+                  approves++;
+                  voters.add(c.user.login);
+                } else if (body.startsWith('-1')) {
+                  rejects++;
+                  voters.add(c.user.login);
+                }
+              }
+              
+              const totalVotes = approves + rejects;
+              const approvalRate = totalVotes > 0 ? approves / totalVotes : 0;
+              
+              console.log(`PR #${pr.number}: ${approves} approves, ${rejects} rejects (${totalVotes} total)`);
+              
+              // Remove voting label
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  name: 'voting'
+                });
+              } catch (e) {
+                console.log('Label removal failed:', e.message);
+              }
+              
+              // Check if requirements met
+              if (totalVotes >= 3 && approvalRate > 0.5) {
+                // Merge
+                try {
+                  await github.rest.pulls.merge({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: pr.number,
+                    merge_method: 'squash'
+                  });
+                  
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    body: `🐣 **Approved and Merged!**\n\n**Voting Result:**\n- ✅ Approves: ${approves}\n- ❌ Rejects: ${rejects}\n- 📊 Approval Rate: ${Math.round(approvalRate * 100)}%\n\nThank you for your contribution, @${pr.user.login}! 🎉`
+                  });
+                  
+                  await github.rest.issues.addLabels({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    labels: ['approved']
+                  });
+                  
+                  console.log(`✅ PR #${pr.number} merged!`);
+                } catch (error) {
+                  console.log('Merge failed:', error.message);
+                }
+              } else {
+                // Reject
+                let reason = '';
+                if (totalVotes < 3) {
+                  reason = `Not enough votes (${totalVotes}/3 minimum)`;
+                } else {
+                  reason = `Approval rate too low (${Math.round(approvalRate * 100)}%, needs >50%)`;
+                }
+                
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  body: `❌ **Not Approved**\n\n**Reason:** ${reason}\n\n**Voting Result:**\n- ✅ Approves: ${approves}\n- ❌ Rejects: ${rejects}\n- 📊 Approval Rate: ${totalVotes > 0 ? Math.round(approvalRate * 100) : 0}%\n\n**Requirements:**\n- Minimum 3 votes: ${totalVotes >= 3 ? '✅' : '❌'}\n- More than 50% approval: ${approvalRate > 0.5 ? '✅' : '❌'}\n\n---\n\n@${pr.user.login}, you can:\n1. Improve your PR based on feedback\n2. Request a new voting period by commenting \`/revote\``
+                });
+                
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  labels: ['needs-work']
+                });
+                
+                console.log(`❌ PR #${pr.number} not approved: ${reason}`);
+              }
+            }
