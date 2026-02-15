@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -323,6 +324,50 @@ func TestWorkerPolicyEndpoint(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&resp)
 	if resp.Data.WorkerID != workerID || resp.Data.Policy.ID != policyID {
 		t.Fatalf("unexpected policy payload worker=%s policy=%s", resp.Data.WorkerID, resp.Data.Policy.ID)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	_, h := newTestServer()
+	w := doJSON(t, h, http.MethodGet, "/metrics", nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "hatchfarm_uptime_seconds") {
+		t.Fatalf("unexpected metrics output: %s", body)
+	}
+}
+
+func TestIssueMachineCertificateEndpoint(t *testing.T) {
+	app, h := newTestServer()
+	w := doJSON(t, h, http.MethodPost, "/api/v1/machines/register", map[string]string{"owner_id": "own_1", "name": "node-a"}, authHeader(app.apiToken))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("register expected 201, got %d", w.Code)
+	}
+	var reg struct {
+		Data struct {
+			Machine struct {
+				ID string `json:"id"`
+			} `json:"machine"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&reg)
+
+	w = doJSON(t, h, http.MethodPost, "/api/v1/machines/"+reg.Data.Machine.ID+"/certificate", nil, authHeader(app.apiToken))
+	if w.Code != http.StatusOK {
+		t.Fatalf("certificate issue expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var certResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			CertificateID string `json:"certificate_id"`
+			MachineID     string `json:"machine_id"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&certResp)
+	if certResp.Data.CertificateID == "" || certResp.Data.MachineID != reg.Data.Machine.ID {
+		t.Fatalf("invalid certificate payload")
 	}
 }
 

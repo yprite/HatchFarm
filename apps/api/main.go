@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	version                  = "0.4.1"
+	version                  = "0.5.0"
 	maxBodyBytes             = 1 << 20 // 1MB
 	heartbeatMaxSkew         = 90 * time.Second
 	nonceReplayWindow        = 5 * time.Minute
@@ -37,6 +37,7 @@ const (
 	maxAuditEvents           = 5000
 	defaultAuditPageSize     = 100
 	maxAuditPageSize         = 500
+	machineCertTTL           = 15 * time.Minute
 )
 
 type HealthResponse struct {
@@ -57,6 +58,14 @@ type Machine struct {
 	Name      string    `json:"name"`
 	Secret    string    `json:"-"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type MachineCertificate struct {
+	CertificateID string    `json:"certificate_id"`
+	MachineID     string    `json:"machine_id"`
+	IssuedAt      time.Time `json:"issued_at"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	Signature     string    `json:"signature"`
 }
 
 type Policy struct {
@@ -102,6 +111,7 @@ type tokenBucket struct {
 type Store struct {
 	mu               sync.RWMutex
 	machines         map[string]*Machine
+	machineCerts     map[string]*MachineCertificate
 	policies         map[string]*Policy
 	consents         map[string]*Consent
 	auditEvents      []*AuditEvent
@@ -186,6 +196,7 @@ func newApp() *App {
 	app := &App{
 		store: &Store{
 			machines:         map[string]*Machine{},
+			machineCerts:     map[string]*MachineCertificate{},
 			policies:         map[string]*Policy{},
 			consents:         map[string]*Consent{},
 			nonces:           map[string]nonceRecord{},
@@ -245,8 +256,10 @@ func initRedisClient() *redis.Client {
 func (a *App) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", a.healthHandler)
+	mux.HandleFunc("/metrics", a.metricsHandler)
 	mux.HandleFunc("/api/v1/status", a.statusHandler)
 	mux.HandleFunc("/api/v1/machines/register", a.authRequired(a.registerMachineHandler))
+	mux.HandleFunc("/api/v1/machines/", a.authRequired(a.machineHandler))
 	mux.HandleFunc("/api/v1/policies", a.authRequired(a.createPolicyHandler))
 	mux.HandleFunc("/api/v1/policies/", a.authRequired(a.activatePolicyHandler))
 	mux.HandleFunc("/api/v1/consents", a.authRequired(a.createConsentHandler))
@@ -273,6 +286,30 @@ func (a *App) statusHandler(w http.ResponseWriter, r *http.Request) {
 			"uptime":  time.Since(a.startedAt).String(),
 		},
 	})
+}
+
+func (a *App) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	a.store.mu.RLock()
+	machines := len(a.store.machines)
+	policies := len(a.store.policies)
+	consents := len(a.store.consents)
+	audits := len(a.store.auditEvents)
+	a.store.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	_, _ = fmt.Fprintf(w, "hatchfarm_uptime_seconds %.0f\n", time.Since(a.startedAt).Seconds())
+	_, _ = fmt.Fprintf(w, "hatchfarm_machines_total %d\n", machines)
+	_, _ = fmt.Fprintf(w, "hatchfarm_policies_total %d\n", policies)
+	_, _ = fmt.Fprintf(w, "hatchfarm_consents_total %d\n", consents)
+	_, _ = fmt.Fprintf(w, "hatchfarm_audit_events_total %d\n", audits)
+}
+
+func (a *App) machineHandler(w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(r.URL.Path, "/certificate") {
+		a.issueMachineCertificateHandler(w, r)
+		return
+	}
+	writeError(w, http.StatusNotFound, "not found")
 }
 
 func (a *App) registerMachineHandler(w http.ResponseWriter, r *http.Request) {
@@ -304,10 +341,74 @@ func (a *App) registerMachineHandler(w http.ResponseWriter, r *http.Request) {
 
 	a.store.mu.Lock()
 	a.store.machines[id] = m
+	cert, err := a.issueMachineCertificateLocked(id)
+	if err != nil {
+		a.store.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	a.appendAuditLocked("machine_registered", "owner:"+req.OwnerID, id, map[string]interface{}{"name": req.Name})
 	a.store.mu.Unlock()
 
-	writeJSON(w, http.StatusCreated, APIResponse{Success: true, Data: map[string]interface{}{"machine": m, "machine_token": secret}})
+	writeJSON(w, http.StatusCreated, APIResponse{Success: true, Data: map[string]interface{}{"machine": m, "machine_token": secret, "machine_certificate": cert}})
+}
+
+func (a *App) issueMachineCertificateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !strings.HasSuffix(r.URL.Path, "/certificate") {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	machineID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/machines/"), "/certificate")
+	if machineID == "" {
+		writeError(w, http.StatusBadRequest, "machine id is required")
+		return
+	}
+	ownerID := ownerIDFromHeader(r)
+	if ownerID == "" {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+
+	a.store.mu.Lock()
+	defer a.store.mu.Unlock()
+	m, ok := a.store.machines[machineID]
+	if !ok {
+		writeError(w, http.StatusNotFound, "machine not found")
+		return
+	}
+	if m.OwnerID != ownerID {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	cert, err := a.issueMachineCertificateLocked(machineID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	a.appendAuditLocked("machine_certificate_issued", "owner:"+ownerID, machineID, map[string]interface{}{"certificate_id": cert.CertificateID})
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: cert})
+}
+
+func (a *App) issueMachineCertificateLocked(machineID string) (*MachineCertificate, error) {
+	idPart := randomID(10)
+	sigPart := randomID(24)
+	if idPart == "" || sigPart == "" {
+		return nil, fmt.Errorf("certificate id generation failed")
+	}
+	now := time.Now().UTC()
+	cert := &MachineCertificate{
+		CertificateID: "mcert_" + idPart,
+		MachineID:     machineID,
+		IssuedAt:      now,
+		ExpiresAt:     now.Add(machineCertTTL),
+		Signature:     sigPart,
+	}
+	a.store.machineCerts[machineID] = cert
+	return cert, nil
 }
 
 func (a *App) createPolicyHandler(w http.ResponseWriter, r *http.Request) {

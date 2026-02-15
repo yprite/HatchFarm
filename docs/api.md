@@ -50,7 +50,9 @@ https://api.hatchfarm.ai/v1
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | /machines/register | Register provider machine (owner-auth required) |
+| POST | /machines/register | Register provider machine (owner-auth required, returns token + short-lived machine certificate) |
+| POST | /machines/{id}/certificate | Issue/rotate short-lived machine certificate (owner-auth required) |
+| GET | /metrics | Basic Prometheus-style runtime metrics |
 | POST | /policies | Create signed policy draft (owner-auth required) |
 | POST | /policies/{id}/activate | Activate policy (owner-auth required) |
 | POST | /consents | Create consent binding owner+worker+policy (owner-auth required) |
