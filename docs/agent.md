@@ -13,6 +13,7 @@
 - `AGENT_POLICY_ID` (required)
 - `AGENT_WORKER_NAME` (default: `agent-node`)
 - `AGENT_HEARTBEAT_SECONDS` (default: `15`)
+- `AGENT_STATE_FILE` (default: `.agent_state.json`)
 
 ## Run
 

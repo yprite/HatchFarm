@@ -28,3 +28,24 @@ func TestEnvIntOrDefault(t *testing.T) {
 		t.Fatalf("expected fallback 15, got %d", got)
 	}
 }
+
+func TestAgentStateRoundtrip(t *testing.T) {
+	tmp := t.TempDir() + "/state.json"
+	s := AgentState{
+		MachineID:     "wrk_1",
+		MachineToken:  "tok_1",
+		MachineCertID: "mcert_1",
+		PolicyID:      "pol_1",
+		UpdatedAt:     time.Now().UTC(),
+	}
+	if err := saveState(tmp, s); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	loaded, ok := loadState(tmp)
+	if !ok {
+		t.Fatal("expected state load success")
+	}
+	if loaded.MachineID != s.MachineID || loaded.MachineCertID != s.MachineCertID {
+		t.Fatal("state mismatch")
+	}
+}

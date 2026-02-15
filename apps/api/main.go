@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	version                  = "0.5.0"
+	version                  = "0.6.0"
 	maxBodyBytes             = 1 << 20 // 1MB
 	heartbeatMaxSkew         = 90 * time.Second
 	nonceReplayWindow        = 5 * time.Minute
@@ -108,10 +108,18 @@ type tokenBucket struct {
 	LastSeen   time.Time
 }
 
+type WorkerStatus struct {
+	WorkerID      string    `json:"worker_id"`
+	LastHeartbeat time.Time `json:"last_heartbeat"`
+	PolicyID      string    `json:"policy_id"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
 type Store struct {
 	mu               sync.RWMutex
 	machines         map[string]*Machine
 	machineCerts     map[string]*MachineCertificate
+	workerStatus     map[string]*WorkerStatus
 	policies         map[string]*Policy
 	consents         map[string]*Consent
 	auditEvents      []*AuditEvent
@@ -198,6 +206,7 @@ func newApp() *App {
 		store: &Store{
 			machines:         map[string]*Machine{},
 			machineCerts:     map[string]*MachineCertificate{},
+			workerStatus:     map[string]*WorkerStatus{},
 			policies:         map[string]*Policy{},
 			consents:         map[string]*Consent{},
 			nonces:           map[string]nonceRecord{},
@@ -640,6 +649,10 @@ func (a *App) workerHandler(w http.ResponseWriter, r *http.Request) {
 		a.workerPolicyHandler(w, r)
 		return
 	}
+	if strings.HasSuffix(r.URL.Path, "/status") {
+		a.workerStatusHandler(w, r)
+		return
+	}
 	writeError(w, http.StatusNotFound, "not found")
 }
 
@@ -770,9 +783,56 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.store.mu.Lock()
+	a.store.workerStatus[workerID] = &WorkerStatus{
+		WorkerID:      workerID,
+		LastHeartbeat: now,
+		PolicyID:      req.PolicyID,
+		UpdatedAt:     now,
+	}
 	a.appendAuditLocked("worker_heartbeat", "worker:"+workerID, workerID, map[string]interface{}{"policy_id": req.PolicyID})
 	a.store.mu.Unlock()
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"worker_id": workerID, "accepted": true}})
+}
+
+func (a *App) workerStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !strings.HasSuffix(r.URL.Path, "/status") {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	workerID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/workers/"), "/status")
+	if workerID == "" {
+		writeError(w, http.StatusBadRequest, "worker id is required")
+		return
+	}
+
+	ownerID := ownerIDFromHeader(r)
+	auth := r.Header.Get("Authorization")
+	if ownerID == "" || !strings.HasPrefix(auth, "Bearer ") || !hmac.Equal([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(a.apiToken)) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	a.store.mu.RLock()
+	defer a.store.mu.RUnlock()
+	m, ok := a.store.machines[workerID]
+	if !ok {
+		writeError(w, http.StatusNotFound, "worker not found")
+		return
+	}
+	if m.OwnerID != ownerID {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	status, ok := a.store.workerStatus[workerID]
+	if !ok {
+		writeError(w, http.StatusNotFound, "worker status not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: status})
 }
 
 func (a *App) workerPolicyHandler(w http.ResponseWriter, r *http.Request) {

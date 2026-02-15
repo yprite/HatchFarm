@@ -53,6 +53,7 @@ https://api.hatchfarm.ai/v1
 | POST | /machines/register | Register provider machine (owner-auth required, returns token + short-lived machine certificate) |
 | POST | /machines/{id}/certificate | Issue/rotate short-lived machine certificate (owner-auth required) |
 | GET | /workers/{id}/policy | Worker policy fetch (requires machine token + certificate id) |
+| GET | /workers/{id}/status | Owner-auth worker runtime status (last heartbeat / policy) |
 | GET | /metrics | Basic Prometheus-style runtime metrics (auth required unless `METRICS_PUBLIC=true`) |
 | POST | /policies | Create signed policy draft (owner-auth required) |
 | POST | /policies/{id}/activate | Activate policy (owner-auth required) |

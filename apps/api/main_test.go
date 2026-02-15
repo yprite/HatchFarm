@@ -347,6 +347,40 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+func TestWorkerStatusEndpoint(t *testing.T) {
+	app, h := newTestServer()
+	workerID, workerToken, workerCertID, policyID := setupWorkerConsent(t, h, app.apiToken)
+
+	ts := time.Now().UTC().Format(time.RFC3339)
+	nonce := "status-1"
+	sig := signHeartbeat(workerToken, workerID, ts, nonce, policyID)
+	w := doJSON(t, h, http.MethodPost, "/api/v1/workers/"+workerID+"/heartbeat", map[string]interface{}{
+		"timestamp": ts,
+		"nonce":     nonce,
+		"policy_id": policyID,
+		"signature": sig,
+	}, map[string]string{"X-Machine-Token": workerToken, "X-Machine-Certificate-Id": workerCertID})
+	if w.Code != http.StatusOK {
+		t.Fatalf("heartbeat expected 200, got %d", w.Code)
+	}
+
+	w = doJSON(t, h, http.MethodGet, "/api/v1/workers/"+workerID+"/status", nil, authHeader(app.apiToken))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			WorkerID string `json:"worker_id"`
+			PolicyID string `json:"policy_id"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Data.WorkerID != workerID || resp.Data.PolicyID != policyID {
+		t.Fatalf("unexpected worker status payload")
+	}
+}
+
 func TestIssueMachineCertificateEndpoint(t *testing.T) {
 	app, h := newTestServer()
 	w := doJSON(t, h, http.MethodPost, "/api/v1/machines/register", map[string]string{"owner_id": "own_1", "name": "node-a"}, authHeader(app.apiToken))

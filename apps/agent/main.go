@@ -33,6 +33,15 @@ type AgentConfig struct {
 	WorkerName       string
 	PolicyID         string
 	HeartbeatSeconds int
+	StateFile        string
+}
+
+type AgentState struct {
+	MachineID     string    `json:"machine_id"`
+	MachineToken  string    `json:"machine_token"`
+	MachineCertID string    `json:"machine_certificate_id"`
+	PolicyID      string    `json:"policy_id"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type RegisterResponse struct {
@@ -77,18 +86,47 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	machineID, machineToken, machineCertID, err := registerMachineWithRetry(ctx, client, cfg)
-	if err != nil {
-		log.Fatalf("register machine failed: %v", err)
+	var machineID, machineToken, machineCertID string
+	state, loaded := loadState(cfg.StateFile)
+	if loaded {
+		machineID = state.MachineID
+		machineToken = state.MachineToken
+		machineCertID = state.MachineCertID
+		log.Printf("loaded local agent state machine_id=%s", machineID)
 	}
-	log.Printf("registered machine_id=%s", machineID)
+
+	if machineID == "" || machineToken == "" || machineCertID == "" {
+		var err error
+		machineID, machineToken, machineCertID, err = registerMachineWithRetry(ctx, client, cfg)
+		if err != nil {
+			log.Fatalf("register machine failed: %v", err)
+		}
+		log.Printf("registered machine_id=%s", machineID)
+	}
 
 	resolvedPolicyID, err := fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
 	if err != nil {
-		log.Fatalf("worker policy sync failed: %v", err)
+		log.Printf("policy sync with saved/issued credentials failed, re-registering: %v", err)
+		machineID, machineToken, machineCertID, err = registerMachineWithRetry(ctx, client, cfg)
+		if err != nil {
+			log.Fatalf("re-register machine failed: %v", err)
+		}
+		resolvedPolicyID, err = fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
+		if err != nil {
+			log.Fatalf("worker policy sync failed after re-register: %v", err)
+		}
 	}
 	if resolvedPolicyID != cfg.PolicyID {
 		log.Fatalf("worker policy mismatch: expected=%s got=%s", cfg.PolicyID, resolvedPolicyID)
+	}
+	if err := saveState(cfg.StateFile, AgentState{
+		MachineID:     machineID,
+		MachineToken:  machineToken,
+		MachineCertID: machineCertID,
+		PolicyID:      resolvedPolicyID,
+		UpdatedAt:     time.Now().UTC(),
+	}); err != nil {
+		log.Printf("warning: failed to persist agent state: %v", err)
 	}
 
 	heartbeatInterval := time.Duration(cfg.HeartbeatSeconds) * time.Second
@@ -134,6 +172,7 @@ func loadConfig() AgentConfig {
 		WorkerName:       envOrDefault("AGENT_WORKER_NAME", "agent-node"),
 		PolicyID:         os.Getenv("AGENT_POLICY_ID"),
 		HeartbeatSeconds: envIntOrDefault("AGENT_HEARTBEAT_SECONDS", 15),
+		StateFile:        envOrDefault("AGENT_STATE_FILE", ".agent_state.json"),
 	}
 }
 
@@ -292,6 +331,29 @@ func signHeartbeat(secret, workerID, timestamp, nonce, policyID string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte(workerID + "|" + timestamp + "|" + nonce + "|" + policyID))
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func loadState(path string) (AgentState, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return AgentState{}, false
+	}
+	var s AgentState
+	if err := json.Unmarshal(b, &s); err != nil {
+		return AgentState{}, false
+	}
+	if s.MachineID == "" || s.MachineToken == "" || s.MachineCertID == "" {
+		return AgentState{}, false
+	}
+	return s, true
+}
+
+func saveState(path string, s AgentState) error {
+	b, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
 }
 
 func randomID(size int) string {
