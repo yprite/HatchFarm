@@ -25,6 +25,11 @@ https://api.hatchfarm.ai/v1
 - Policy/consent write requests: HMAC signatures validated server-side (dev baseline)
   - Policy signature payload: `owner_id|json(rules)`
   - Consent signature payload: `owner_id|worker_id|policy_id`
+- Policy rules validation (current allowlist):
+  - Required: `max_cpu_percent` (1~100)
+  - Optional: `max_memory_percent`, `max_gpu_percent` (1~100)
+  - Optional: `timezone` (non-empty string)
+  - Optional: `allowed_hours` (array of integers 0~23)
 - Heartbeat replay defense: timestamp skew window + nonce replay check
 - Basic API protection: rate limiting + request body size limits
 - Transport guard: optional HTTPS enforcement (`REQUIRE_HTTPS=true`), with explicit proxy-header trust toggle (`TRUST_PROXY_HEADERS=true`)

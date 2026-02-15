@@ -231,6 +231,37 @@ func TestRateLimitKicksIn(t *testing.T) {
 	}
 }
 
+func TestPolicyValidationRejectsUnknownField(t *testing.T) {
+	app, h := newTestServer()
+	w := doJSON(t, h, http.MethodPost, "/api/v1/policies", map[string]interface{}{
+		"owner_id":  "own_1",
+		"signature": signPolicySignature(app.apiToken, "own_1", map[string]interface{}{"max_cpu_percent": 60, "evil_key": true}),
+		"rules": map[string]interface{}{
+			"max_cpu_percent": 60,
+			"evil_key":        true,
+		},
+	}, authHeader(app.apiToken))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPolicyValidationRejectsInvalidAllowedHours(t *testing.T) {
+	app, h := newTestServer()
+	rules := map[string]interface{}{
+		"max_cpu_percent": 60,
+		"allowed_hours":   []interface{}{1.5, 2},
+	}
+	w := doJSON(t, h, http.MethodPost, "/api/v1/policies", map[string]interface{}{
+		"owner_id":  "own_1",
+		"signature": signPolicySignature(app.apiToken, "own_1", rules),
+		"rules":     rules,
+	}, authHeader(app.apiToken))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func setupWorkerConsent(t *testing.T, h http.Handler, token string) (workerID, workerToken, policyID string) {
 	t.Helper()
 	w := doJSON(t, h, http.MethodPost, "/api/v1/machines/register", map[string]string{"owner_id": "own_1", "name": "node-a"}, authHeader(token))

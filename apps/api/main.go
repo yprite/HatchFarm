@@ -745,6 +745,20 @@ func validatePolicyRules(rules map[string]interface{}) error {
 	if rules == nil {
 		return fmt.Errorf("rules are required")
 	}
+
+	allowed := map[string]struct{}{
+		"max_cpu_percent":    {},
+		"max_memory_percent": {},
+		"max_gpu_percent":    {},
+		"timezone":           {},
+		"allowed_hours":      {},
+	}
+	for k := range rules {
+		if _, ok := allowed[k]; !ok {
+			return fmt.Errorf("unsupported policy field: %s", k)
+		}
+	}
+
 	if v, ok := rules["max_cpu_percent"]; ok {
 		n, ok := asFloat(v)
 		if !ok || n < 1 || n > 100 {
@@ -753,12 +767,41 @@ func validatePolicyRules(rules map[string]interface{}) error {
 	} else {
 		return fmt.Errorf("max_cpu_percent is required")
 	}
+
 	if v, ok := rules["max_memory_percent"]; ok {
 		n, ok := asFloat(v)
 		if !ok || n < 1 || n > 100 {
 			return fmt.Errorf("max_memory_percent must be between 1 and 100")
 		}
 	}
+
+	if v, ok := rules["max_gpu_percent"]; ok {
+		n, ok := asFloat(v)
+		if !ok || n < 1 || n > 100 {
+			return fmt.Errorf("max_gpu_percent must be between 1 and 100")
+		}
+	}
+
+	if v, ok := rules["timezone"]; ok {
+		s, ok := v.(string)
+		if !ok || strings.TrimSpace(s) == "" {
+			return fmt.Errorf("timezone must be a non-empty string")
+		}
+	}
+
+	if v, ok := rules["allowed_hours"]; ok {
+		arr, ok := v.([]interface{})
+		if !ok || len(arr) == 0 || len(arr) > 24 {
+			return fmt.Errorf("allowed_hours must be a non-empty array")
+		}
+		for _, raw := range arr {
+			hour, ok := asFloat(raw)
+			if !ok || int(hour) < 0 || int(hour) > 23 || hour != float64(int(hour)) {
+				return fmt.Errorf("allowed_hours values must be integers between 0 and 23")
+			}
+		}
+	}
+
 	return nil
 }
 
