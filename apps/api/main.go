@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,7 +23,7 @@ import (
 )
 
 const (
-	version                  = "0.3.0"
+	version                  = "0.4.0"
 	maxBodyBytes             = 1 << 20 // 1MB
 	heartbeatMaxSkew         = 90 * time.Second
 	nonceReplayWindow        = 5 * time.Minute
@@ -30,6 +31,9 @@ const (
 	rateLimitBurst           = 20.0
 	rateBucketTTL            = 10 * time.Minute
 	maxRateBuckets           = 20000
+	maxAuditEvents           = 5000
+	defaultAuditPageSize     = 100
+	maxAuditPageSize         = 500
 )
 
 type HealthResponse struct {
@@ -120,7 +124,7 @@ func main() {
 	mux := app.routes()
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      app.corsMiddleware(app.loggingMiddleware(app.bodyLimitMiddleware(app.rateLimitMiddleware(mux)))),
+		Handler:      app.corsMiddleware(app.requestIDMiddleware(app.loggingMiddleware(app.tlsEnforcementMiddleware(app.bodyLimitMiddleware(app.rateLimitMiddleware(mux)))))),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -152,8 +156,12 @@ func main() {
 func newApp() *App {
 	apiToken := os.Getenv("HATCHFARM_API_TOKEN")
 	if apiToken == "" {
-		apiToken = "boot_" + randomID(16)
-		log.Printf("warning: HATCHFARM_API_TOKEN not set; generated ephemeral token")
+		if rid := randomID(16); rid != "" {
+			apiToken = "boot_" + rid
+			log.Printf("warning: HATCHFARM_API_TOKEN not set; generated ephemeral token")
+		} else {
+			log.Fatal("failed to initialize API token")
+		}
 	}
 
 	origins := map[string]struct{}{}
@@ -236,8 +244,13 @@ func (a *App) registerMachineHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := "wrk_" + randomID(8)
+	idPart := randomID(8)
 	secret := randomID(24)
+	if idPart == "" || secret == "" {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	id := "wrk_" + idPart
 	m := &Machine{ID: id, OwnerID: req.OwnerID, Name: req.Name, Secret: secret, CreatedAt: time.Now().UTC()}
 
 	a.store.mu.Lock()
@@ -266,6 +279,14 @@ func (a *App) createPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "owner_id and signature are required")
 		return
 	}
+	if err := validatePolicyRules(req.Rules); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !verifyPolicySignature(a.apiToken, req.OwnerID, req.Rules, req.Signature) {
+		writeError(w, http.StatusUnauthorized, "invalid policy signature")
+		return
+	}
 
 	a.store.mu.Lock()
 	defer a.store.mu.Unlock()
@@ -277,7 +298,12 @@ func (a *App) createPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	id := "pol_" + randomID(8)
+	idPart := randomID(8)
+	if idPart == "" {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	id := "pol_" + idPart
 	now := time.Now().UTC()
 	policy := &Policy{
 		ID:        id,
@@ -317,6 +343,11 @@ func (a *App) activatePolicyHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "policy not found")
 		return
 	}
+	ownerID := ownerIDFromHeader(r)
+	if ownerID == "" || ownerID != policy.OwnerID {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	if policy.Signature == "" {
 		writeError(w, http.StatusBadRequest, "policy signature required")
 		return
@@ -346,6 +377,10 @@ func (a *App) createConsentHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "owner_id, worker_id, policy_id, signature are required")
 		return
 	}
+	if !verifyConsentSignature(a.apiToken, req.OwnerID, req.WorkerID, req.PolicyID, req.Signature) {
+		writeError(w, http.StatusUnauthorized, "invalid consent signature")
+		return
+	}
 
 	a.store.mu.Lock()
 	defer a.store.mu.Unlock()
@@ -360,8 +395,13 @@ func (a *App) createConsentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	consentIDPart := randomID(8)
+	if consentIDPart == "" {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	consent := &Consent{
-		ID:          "con_" + randomID(8),
+		ID:          "con_" + consentIDPart,
 		OwnerID:     req.OwnerID,
 		WorkerID:    req.WorkerID,
 		PolicyID:    req.PolicyID,
@@ -393,6 +433,11 @@ func (a *App) revokeConsentHandler(w http.ResponseWriter, r *http.Request) {
 	consent, ok := a.store.consents[id]
 	if !ok {
 		writeError(w, http.StatusNotFound, "consent not found")
+		return
+	}
+	ownerID := ownerIDFromHeader(r)
+	if ownerID == "" || ownerID != consent.OwnerID {
+		writeError(w, http.StatusForbidden, "forbidden")
 		return
 	}
 	now := time.Now().UTC()
@@ -486,26 +531,76 @@ func (a *App) auditEventsHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	limit := defaultAuditPageSize
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 1 {
+			writeError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		if v > maxAuditPageSize {
+			v = maxAuditPageSize
+		}
+		limit = v
+	}
+	offset := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("offset")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "invalid offset")
+			return
+		}
+		offset = v
+	}
+
+	ownerID := ownerIDFromHeader(r)
+	if ownerID == "" {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+
 	a.store.mu.RLock()
 	defer a.store.mu.RUnlock()
-	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"events": a.store.auditEvents}})
+	filtered := make([]*AuditEvent, 0, len(a.store.auditEvents))
+	for _, ev := range a.store.auditEvents {
+		if strings.HasPrefix(ev.Actor, "owner:"+ownerID) || ev.Actor == "worker:"+ownerID {
+			filtered = append(filtered, ev)
+		}
+	}
+	total := len(filtered)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	events := filtered[offset:end]
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"events": events, "total": total, "limit": limit, "offset": offset}})
 }
 
 func (a *App) appendAuditLocked(eventType, actor, objectID string, metadata map[string]interface{}) {
+	auditIDPart := randomID(8)
+	if auditIDPart == "" {
+		return
+	}
 	a.store.auditEvents = append(a.store.auditEvents, &AuditEvent{
-		ID:        "aud_" + randomID(8),
+		ID:        "aud_" + auditIDPart,
 		Type:      eventType,
 		Actor:     actor,
 		ObjectID:  objectID,
 		Metadata:  metadata,
 		CreatedAt: time.Now().UTC(),
 	})
+	if len(a.store.auditEvents) > maxAuditEvents {
+		a.store.auditEvents = append([]*AuditEvent(nil), a.store.auditEvents[len(a.store.auditEvents)-maxAuditEvents:]...)
+	}
 }
 
 func randomID(size int) string {
 	b := make([]byte, size)
 	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("fallback_%d", time.Now().UnixNano())
+		return ""
 	}
 	return hex.EncodeToString(b)
 }
@@ -516,9 +611,64 @@ func signHeartbeat(secret, workerID, timestamp, nonce, policyID string) string {
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
 
+func signPolicySignature(secret, ownerID string, rules map[string]interface{}) string {
+	payload, _ := json.Marshal(rules)
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(ownerID + "|" + string(payload)))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func signConsentSignature(secret, ownerID, workerID, policyID string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(ownerID + "|" + workerID + "|" + policyID))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func verifyPolicySignature(secret, ownerID string, rules map[string]interface{}, signature string) bool {
+	expected := signPolicySignature(secret, ownerID, rules)
+	return hmac.Equal([]byte(expected), []byte(signature))
+}
+
+func verifyConsentSignature(secret, ownerID, workerID, policyID, signature string) bool {
+	expected := signConsentSignature(secret, ownerID, workerID, policyID)
+	return hmac.Equal([]byte(expected), []byte(signature))
+}
+
 func verifyHeartbeatSignature(secret, workerID, timestamp, nonce, policyID, signature string) bool {
 	expected := signHeartbeat(secret, workerID, timestamp, nonce, policyID)
 	return hmac.Equal([]byte(expected), []byte(signature))
+}
+
+func validatePolicyRules(rules map[string]interface{}) error {
+	if rules == nil {
+		return fmt.Errorf("rules are required")
+	}
+	if v, ok := rules["max_cpu_percent"]; ok {
+		n, ok := asFloat(v)
+		if !ok || n < 1 || n > 100 {
+			return fmt.Errorf("max_cpu_percent must be between 1 and 100")
+		}
+	} else {
+		return fmt.Errorf("max_cpu_percent is required")
+	}
+	if v, ok := rules["max_memory_percent"]; ok {
+		n, ok := asFloat(v)
+		if !ok || n < 1 || n > 100 {
+			return fmt.Errorf("max_memory_percent must be between 1 and 100")
+		}
+	}
+	return nil
+}
+
+func asFloat(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	default:
+		return 0, false
+	}
 }
 
 func (a *App) cleanupNoncesLocked(now time.Time) {
@@ -553,6 +703,26 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, APIResponse{Success: false, Error: msg})
 }
 
+func (a *App) requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rid := randomID(8)
+		r.Header.Set("X-Request-ID", rid)
+		w.Header().Set("X-Request-ID", rid)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requestIDFromHeader(r *http.Request) string {
+	if rid := r.Header.Get("X-Request-ID"); rid != "" {
+		return rid
+	}
+	return "-"
+}
+
+func ownerIDFromHeader(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("X-Owner-ID"))
+}
+
 func (a *App) authRequired(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
@@ -573,7 +743,7 @@ func (a *App) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
+		log.Printf("request_id=%s method=%s path=%s duration=%s", requestIDFromHeader(r), r.Method, r.URL.Path, time.Since(start))
 	})
 }
 
@@ -583,6 +753,33 @@ func (a *App) bodyLimitMiddleware(next http.Handler) http.Handler {
 			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) tlsEnforcementMiddleware(next http.Handler) http.Handler {
+	requireHTTPS := strings.EqualFold(envOrDefault("REQUIRE_HTTPS", "false"), "true")
+	trustProxy := strings.EqualFold(envOrDefault("TRUST_PROXY_HEADERS", "false"), "true")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !requireHTTPS {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.TLS != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if trustProxy {
+			proto := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
+			if proto == "https" {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		writeError(w, http.StatusUpgradeRequired, "https required")
 	})
 }
 
@@ -614,10 +811,13 @@ func (a *App) allowRequest(key string) bool {
 	bucket, ok := a.rateBuckets[key]
 	if !ok {
 		if len(a.rateBuckets) >= maxRateBuckets {
-			return false
+			key = "_overflow_shared"
+			bucket, ok = a.rateBuckets[key]
 		}
-		a.rateBuckets[key] = &tokenBucket{Tokens: rateLimitBurst - 1, LastRefill: now, LastSeen: now}
-		return true
+		if !ok {
+			a.rateBuckets[key] = &tokenBucket{Tokens: rateLimitBurst - 1, LastRefill: now, LastSeen: now}
+			return true
+		}
 	}
 
 	elapsed := now.Sub(bucket.LastRefill).Seconds()

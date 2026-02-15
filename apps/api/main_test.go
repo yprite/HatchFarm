@@ -34,7 +34,7 @@ func doJSON(t *testing.T, h http.Handler, method, path string, body interface{},
 }
 
 func authHeader() map[string]string {
-	return map[string]string{"Authorization": "Bearer test-token"}
+	return map[string]string{"Authorization": "Bearer test-token", "X-Owner-ID": "own_1"}
 }
 
 func TestHealthHandler(t *testing.T) {
@@ -81,12 +81,11 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&reg)
 
 	// create policy
+	policyRules := map[string]interface{}{"max_cpu_percent": 60}
 	w = doJSON(t, h, http.MethodPost, "/api/v1/policies", map[string]interface{}{
 		"owner_id":  "own_1",
-		"signature": "sig_owner",
-		"rules": map[string]interface{}{
-			"max_cpu_percent": 60,
-		},
+		"signature": signPolicySignature("test-token", "own_1", policyRules),
+		"rules":     policyRules,
 	}, authHeader())
 	if w.Code != http.StatusCreated {
 		t.Fatalf("policy create expected 201, got %d: %s", w.Code, w.Body.String())
@@ -109,7 +108,7 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 		"owner_id":  "own_1",
 		"worker_id": reg.Data.Machine.ID,
 		"policy_id": pol.Data.ID,
-		"signature": "consent_sig",
+		"signature": signConsentSignature("test-token", "own_1", reg.Data.Machine.ID, pol.Data.ID),
 	}, authHeader())
 	if w.Code != http.StatusCreated {
 		t.Fatalf("consent expected 201, got %d: %s", w.Code, w.Body.String())
@@ -248,7 +247,8 @@ func setupWorkerConsent(t *testing.T, h http.Handler) (workerID, workerToken, po
 	}
 	_ = json.NewDecoder(w.Body).Decode(&reg)
 
-	w = doJSON(t, h, http.MethodPost, "/api/v1/policies", map[string]interface{}{"owner_id": "own_1", "signature": "sig", "rules": map[string]interface{}{}}, authHeader())
+	rules := map[string]interface{}{"max_cpu_percent": 60}
+	w = doJSON(t, h, http.MethodPost, "/api/v1/policies", map[string]interface{}{"owner_id": "own_1", "signature": signPolicySignature("test-token", "own_1", rules), "rules": rules}, authHeader())
 	if w.Code != http.StatusCreated {
 		t.Fatalf("policy create expected 201, got %d", w.Code)
 	}
@@ -264,7 +264,7 @@ func setupWorkerConsent(t *testing.T, h http.Handler) (workerID, workerToken, po
 		t.Fatalf("policy activate expected 200, got %d", w.Code)
 	}
 
-	w = doJSON(t, h, http.MethodPost, "/api/v1/consents", map[string]string{"owner_id": "own_1", "worker_id": reg.Data.Machine.ID, "policy_id": pol.Data.ID, "signature": "ok"}, authHeader())
+	w = doJSON(t, h, http.MethodPost, "/api/v1/consents", map[string]string{"owner_id": "own_1", "worker_id": reg.Data.Machine.ID, "policy_id": pol.Data.ID, "signature": signConsentSignature("test-token", "own_1", reg.Data.Machine.ID, pol.Data.ID)}, authHeader())
 	if w.Code != http.StatusCreated {
 		t.Fatalf("consent expected 201, got %d", w.Code)
 	}

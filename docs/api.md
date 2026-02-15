@@ -19,9 +19,14 @@ https://api.hatchfarm.ai/v1
 
 ### Current Dev Auth Baseline (v0.3)
 - Owner APIs: `Authorization: Bearer <HATCHFARM_API_TOKEN>`
-  - If missing, server generates an ephemeral token at boot and logs a warning (dev fallback only).
+  - Sensitive owner-scoped routes also require `X-Owner-ID` header matching resource owner.
+  - If token is missing, server generates an ephemeral token at boot and logs a warning (dev fallback only).
 - Worker heartbeat: `X-Machine-Token` + HMAC signature payload
+- Policy/consent write requests: HMAC signatures validated server-side (dev baseline)
+  - Policy signature payload: `owner_id|json(rules)`
+  - Consent signature payload: `owner_id|worker_id|policy_id`
 - Heartbeat replay defense: timestamp skew window + nonce replay check
+- Basic API protection: rate limiting + request body size limits
 
 ---
 
@@ -37,7 +42,7 @@ https://api.hatchfarm.ai/v1
 | POST | /consents | Create consent binding owner+worker+policy (owner-auth required) |
 | POST | /consents/{id}/revoke | Revoke consent (owner-auth required) |
 | POST | /workers/{id}/heartbeat | Worker heartbeat with machine token + signature |
-| GET | /audit/events | List audit events (owner-auth required) |
+| GET | /audit/events | List audit events (owner-auth required, supports `limit`/`offset`) |
 
 > Note: Current code uses `/api/v1/*` prefix. Tables above omit prefix for readability.
 
