@@ -24,4 +24,8 @@ go run .
 
 - Heartbeat signature format matches API server expectation:
   `HMAC(machine_token, worker_id|timestamp|nonce|policy_id)`
+- Reliability guards included:
+  - HTTP client timeout (10s)
+  - machine register retry with exponential backoff
+  - heartbeat retry backoff with capped consecutive failure exit
 - This is a baseline runtime loop for Sprint 01; policy sync, attestation, and update orchestration are planned next.

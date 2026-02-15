@@ -18,6 +18,14 @@ import (
 	"time"
 )
 
+const (
+	httpTimeout                  = 10 * time.Second
+	registerMaxAttempts          = 5
+	registerBackoffBase          = 2 * time.Second
+	heartbeatFailBackoffCap      = 60 * time.Second
+	heartbeatMaxConsecutiveFails = 15
+)
+
 type AgentConfig struct {
 	APIBaseURL       string
 	OwnerToken       string
@@ -50,29 +58,48 @@ func main() {
 		log.Fatal("AGENT_OWNER_TOKEN, AGENT_OWNER_ID, AGENT_POLICY_ID are required")
 	}
 
-	machineID, machineToken, err := registerMachine(cfg)
+	client := &http.Client{Timeout: httpTimeout}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	machineID, machineToken, err := registerMachineWithRetry(ctx, client, cfg)
 	if err != nil {
 		log.Fatalf("register machine failed: %v", err)
 	}
 	log.Printf("registered machine_id=%s", machineID)
 
-	ticker := time.NewTicker(time.Duration(cfg.HeartbeatSeconds) * time.Second)
-	defer ticker.Stop()
+	heartbeatInterval := time.Duration(cfg.HeartbeatSeconds) * time.Second
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = 15 * time.Second
+	}
+	timer := time.NewTimer(heartbeatInterval)
+	defer timer.Stop()
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	consecutiveFails := 0
 
 	for {
 		select {
-		case <-ticker.C:
-			if err := sendHeartbeat(cfg, machineID, machineToken); err != nil {
-				log.Printf("heartbeat error: %v", err)
-			} else {
-				log.Printf("heartbeat ok machine_id=%s", machineID)
-			}
-		case <-quit:
+		case <-ctx.Done():
 			log.Println("agent shutting down")
 			return
+		case <-timer.C:
+			nextDelay := heartbeatInterval
+			if err := sendHeartbeat(ctx, client, cfg, machineID, machineToken); err != nil {
+				consecutiveFails++
+				if consecutiveFails >= heartbeatMaxConsecutiveFails {
+					log.Fatalf("heartbeat failed %d times consecutively, exiting: %v", consecutiveFails, err)
+				}
+				nextDelay = heartbeatFailureBackoff(consecutiveFails)
+				log.Printf("heartbeat error (streak=%d): %v; next_retry=%s", consecutiveFails, err, nextDelay)
+			} else {
+				if consecutiveFails > 0 {
+					log.Printf("heartbeat recovered after %d failures", consecutiveFails)
+				}
+				consecutiveFails = 0
+				log.Printf("heartbeat ok machine_id=%s", machineID)
+			}
+			timer.Reset(nextDelay)
 		}
 	}
 }
@@ -108,11 +135,33 @@ func envIntOrDefault(key string, def int) int {
 	return n
 }
 
-func registerMachine(cfg AgentConfig) (machineID, machineToken string, err error) {
+func registerMachineWithRetry(ctx context.Context, client *http.Client, cfg AgentConfig) (machineID, machineToken string, err error) {
+	var lastErr error
+	for attempt := 1; attempt <= registerMaxAttempts; attempt++ {
+		machineID, machineToken, err = registerMachine(ctx, client, cfg)
+		if err == nil {
+			return machineID, machineToken, nil
+		}
+		lastErr = err
+		if attempt == registerMaxAttempts {
+			break
+		}
+		backoff := registerBackoffBase * time.Duration(1<<(attempt-1))
+		log.Printf("register attempt %d/%d failed: %v (retry in %s)", attempt, registerMaxAttempts, err, backoff)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		}
+	}
+	return "", "", fmt.Errorf("register failed after retries: %w", lastErr)
+}
+
+func registerMachine(ctx context.Context, client *http.Client, cfg AgentConfig) (machineID, machineToken string, err error) {
 	payload := map[string]string{"owner_id": cfg.OwnerID, "name": cfg.WorkerName}
 	body, _ := json.Marshal(payload)
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, cfg.APIBaseURL+"/api/v1/machines/register", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.APIBaseURL+"/api/v1/machines/register", bytes.NewReader(body))
 	if err != nil {
 		return "", "", err
 	}
@@ -120,7 +169,7 @@ func registerMachine(cfg AgentConfig) (machineID, machineToken string, err error
 	req.Header.Set("Authorization", "Bearer "+cfg.OwnerToken)
 	req.Header.Set("X-Owner-ID", cfg.OwnerID)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", "", err
 	}
@@ -133,10 +182,13 @@ func registerMachine(cfg AgentConfig) (machineID, machineToken string, err error
 	if resp.StatusCode >= 300 || !out.Success {
 		return "", "", fmt.Errorf("register failed: status=%d error=%s", resp.StatusCode, out.Error)
 	}
+	if out.Data.Machine.ID == "" || out.Data.MachineToken == "" {
+		return "", "", fmt.Errorf("register returned incomplete machine credentials")
+	}
 	return out.Data.Machine.ID, out.Data.MachineToken, nil
 }
 
-func sendHeartbeat(cfg AgentConfig, machineID, machineToken string) error {
+func sendHeartbeat(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken string) error {
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 	nonce := randomID(12)
 	sig := signHeartbeat(machineToken, machineID, timestamp, nonce, cfg.PolicyID)
@@ -152,14 +204,14 @@ func sendHeartbeat(cfg AgentConfig, machineID, machineToken string) error {
 	}
 	body, _ := json.Marshal(payload)
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, cfg.APIBaseURL+"/api/v1/workers/"+machineID+"/heartbeat", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.APIBaseURL+"/api/v1/workers/"+machineID+"/heartbeat", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Machine-Token", machineToken)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -173,6 +225,17 @@ func sendHeartbeat(cfg AgentConfig, machineID, machineToken string) error {
 		return fmt.Errorf("heartbeat failed: status=%d error=%s", resp.StatusCode, out.Error)
 	}
 	return nil
+}
+
+func heartbeatFailureBackoff(streak int) time.Duration {
+	if streak < 1 {
+		return 0
+	}
+	base := time.Duration(streak*streak) * time.Second
+	if base > heartbeatFailBackoffCap {
+		return heartbeatFailBackoffCap
+	}
+	return base
 }
 
 func signHeartbeat(secret, workerID, timestamp, nonce, policyID string) string {
