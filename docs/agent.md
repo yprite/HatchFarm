@@ -23,6 +23,7 @@ go run .
 
 ## Notes
 
+- Agent uses machine token + machine certificate id for policy/heartbeat requests.
 - Heartbeat signature format matches API server expectation:
   `HMAC(machine_token, worker_id|timestamp|nonce|policy_id)`
 - Reliability guards included:

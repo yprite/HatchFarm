@@ -133,6 +133,7 @@ type App struct {
 	redisRateLimitFallback bool
 	redisRateLimitWindow   time.Duration
 	redisRateLimitMax      int
+	metricsPublic          bool
 }
 
 func main() {
@@ -211,6 +212,7 @@ func newApp() *App {
 		redisRateLimitFallback: strings.EqualFold(envOrDefault("REDIS_RATE_LIMIT_FALLBACK", "true"), "true"),
 		redisRateLimitWindow:   time.Duration(envIntOrDefault("REDIS_RATE_LIMIT_WINDOW_SECONDS", 1)) * time.Second,
 		redisRateLimitMax:      envIntOrDefault("REDIS_RATE_LIMIT_MAX_REQUESTS", int(rateLimitBurst)),
+		metricsPublic:          strings.EqualFold(envOrDefault("METRICS_PUBLIC", "false"), "true"),
 	}
 	app.redisClient = initRedisClient()
 	return app
@@ -289,19 +291,17 @@ func (a *App) statusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) metricsHandler(w http.ResponseWriter, r *http.Request) {
-	a.store.mu.RLock()
-	machines := len(a.store.machines)
-	policies := len(a.store.policies)
-	consents := len(a.store.consents)
-	audits := len(a.store.auditEvents)
-	a.store.mu.RUnlock()
+	if !a.metricsPublic {
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") || !hmac.Equal([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(a.apiToken)) {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+	}
 
+	uptime := time.Since(a.startedAt).Seconds()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	_, _ = fmt.Fprintf(w, "hatchfarm_uptime_seconds %.0f\n", time.Since(a.startedAt).Seconds())
-	_, _ = fmt.Fprintf(w, "hatchfarm_machines_total %d\n", machines)
-	_, _ = fmt.Fprintf(w, "hatchfarm_policies_total %d\n", policies)
-	_, _ = fmt.Fprintf(w, "hatchfarm_consents_total %d\n", consents)
-	_, _ = fmt.Fprintf(w, "hatchfarm_audit_events_total %d\n", audits)
+	_, _ = fmt.Fprintf(w, "hatchfarm_uptime_seconds %.0f\n", uptime)
 }
 
 func (a *App) machineHandler(w http.ResponseWriter, r *http.Request) {
@@ -409,6 +409,17 @@ func (a *App) issueMachineCertificateLocked(machineID string) (*MachineCertifica
 	}
 	a.store.machineCerts[machineID] = cert
 	return cert, nil
+}
+
+func (a *App) isMachineCertValidLocked(machineID, certID string, now time.Time) bool {
+	cert, ok := a.store.machineCerts[machineID]
+	if !ok {
+		return false
+	}
+	if cert.CertificateID != certID {
+		return false
+	}
+	return now.Before(cert.ExpiresAt)
 }
 
 func (a *App) createPolicyHandler(w http.ResponseWriter, r *http.Request) {
@@ -659,7 +670,8 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	machineToken := r.Header.Get("X-Machine-Token")
-	if machineToken == "" || req.Timestamp == "" || req.Nonce == "" || req.PolicyID == "" || req.Signature == "" {
+	machineCertID := strings.TrimSpace(r.Header.Get("X-Machine-Certificate-Id"))
+	if machineToken == "" || machineCertID == "" || req.Timestamp == "" || req.Nonce == "" || req.PolicyID == "" || req.Signature == "" {
 		writeError(w, http.StatusBadRequest, "missing required heartbeat fields")
 		return
 	}
@@ -678,6 +690,11 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	a.store.mu.RLock()
 	machine, ok := a.store.machines[workerID]
 	if !ok || machine.Secret != machineToken {
+		a.store.mu.RUnlock()
+		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
+		return
+	}
+	if !a.isMachineCertValidLocked(workerID, machineCertID, now) {
 		a.store.mu.RUnlock()
 		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
 		return
@@ -773,7 +790,8 @@ func (a *App) workerPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	machineToken := strings.TrimSpace(r.Header.Get("X-Machine-Token"))
-	if machineToken == "" {
+	machineCertID := strings.TrimSpace(r.Header.Get("X-Machine-Certificate-Id"))
+	if machineToken == "" || machineCertID == "" {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -783,6 +801,10 @@ func (a *App) workerPolicyHandler(w http.ResponseWriter, r *http.Request) {
 
 	machine, ok := a.store.machines[workerID]
 	if !ok || machine.Secret != machineToken {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if !a.isMachineCertValidLocked(workerID, machineCertID, time.Now().UTC()) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -1271,7 +1293,7 @@ func (a *App) corsMiddleware(next http.Handler) http.Handler {
 		}
 		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Machine-Token")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Machine-Token, X-Machine-Certificate-Id")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)

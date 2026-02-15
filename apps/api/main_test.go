@@ -77,6 +77,9 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 				ID string `json:"id"`
 			} `json:"machine"`
 			MachineToken string `json:"machine_token"`
+			MachineCert  struct {
+				CertificateID string `json:"certificate_id"`
+			} `json:"machine_certificate"`
 		} `json:"data"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&reg)
@@ -132,7 +135,7 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 		"policy_id": pol.Data.ID,
 		"metrics":   map[string]interface{}{"cpu": 35},
 		"signature": sig,
-	}, map[string]string{"X-Machine-Token": reg.Data.MachineToken})
+	}, map[string]string{"X-Machine-Token": reg.Data.MachineToken, "X-Machine-Certificate-Id": reg.Data.MachineCert.CertificateID})
 	if w.Code != http.StatusOK {
 		t.Fatalf("heartbeat expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -150,7 +153,7 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 		"policy_id": pol.Data.ID,
 		"metrics":   map[string]interface{}{"cpu": 20},
 		"signature": signHeartbeat(reg.Data.MachineToken, reg.Data.Machine.ID, ts, "n2", pol.Data.ID),
-	}, map[string]string{"X-Machine-Token": reg.Data.MachineToken})
+	}, map[string]string{"X-Machine-Token": reg.Data.MachineToken, "X-Machine-Certificate-Id": reg.Data.MachineCert.CertificateID})
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("heartbeat after revoke expected 403, got %d: %s", w.Code, w.Body.String())
 	}
@@ -158,14 +161,14 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 
 func TestHeartbeatRejectsBadSignature(t *testing.T) {
 	app, h := newTestServer()
-	workerID, workerToken, policyID := setupWorkerConsent(t, h, app.apiToken)
+	workerID, workerToken, workerCertID, policyID := setupWorkerConsent(t, h, app.apiToken)
 
 	w := doJSON(t, h, http.MethodPost, "/api/v1/workers/"+workerID+"/heartbeat", map[string]interface{}{
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 		"nonce":     "x",
 		"policy_id": policyID,
 		"signature": "bad-signature",
-	}, map[string]string{"X-Machine-Token": workerToken})
+	}, map[string]string{"X-Machine-Token": workerToken, "X-Machine-Certificate-Id": workerCertID})
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
 	}
@@ -173,7 +176,7 @@ func TestHeartbeatRejectsBadSignature(t *testing.T) {
 
 func TestHeartbeatRejectsReplayNonce(t *testing.T) {
 	app, h := newTestServer()
-	workerID, workerToken, policyID := setupWorkerConsent(t, h, app.apiToken)
+	workerID, workerToken, workerCertID, policyID := setupWorkerConsent(t, h, app.apiToken)
 
 	ts := time.Now().UTC().Format(time.RFC3339)
 	nonce := "replay-nonce"
@@ -184,7 +187,7 @@ func TestHeartbeatRejectsReplayNonce(t *testing.T) {
 		"nonce":     nonce,
 		"policy_id": policyID,
 		"signature": sig,
-	}, map[string]string{"X-Machine-Token": workerToken})
+	}, map[string]string{"X-Machine-Token": workerToken, "X-Machine-Certificate-Id": workerCertID})
 	if w.Code != http.StatusOK {
 		t.Fatalf("first heartbeat expected 200, got %d", w.Code)
 	}
@@ -194,7 +197,7 @@ func TestHeartbeatRejectsReplayNonce(t *testing.T) {
 		"nonce":     nonce,
 		"policy_id": policyID,
 		"signature": sig,
-	}, map[string]string{"X-Machine-Token": workerToken})
+	}, map[string]string{"X-Machine-Token": workerToken, "X-Machine-Certificate-Id": workerCertID})
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("replay heartbeat expected 401, got %d", w.Code)
 	}
@@ -202,7 +205,7 @@ func TestHeartbeatRejectsReplayNonce(t *testing.T) {
 
 func TestHeartbeatRejectsStaleTimestamp(t *testing.T) {
 	app, h := newTestServer()
-	workerID, workerToken, policyID := setupWorkerConsent(t, h, app.apiToken)
+	workerID, workerToken, workerCertID, policyID := setupWorkerConsent(t, h, app.apiToken)
 
 	stale := time.Now().UTC().Add(-(heartbeatMaxSkew + 10*time.Second)).Format(time.RFC3339)
 	sig := signHeartbeat(workerToken, workerID, stale, "stale-1", policyID)
@@ -211,7 +214,7 @@ func TestHeartbeatRejectsStaleTimestamp(t *testing.T) {
 		"nonce":     "stale-1",
 		"policy_id": policyID,
 		"signature": sig,
-	}, map[string]string{"X-Machine-Token": workerToken})
+	}, map[string]string{"X-Machine-Token": workerToken, "X-Machine-Certificate-Id": workerCertID})
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("stale heartbeat expected 401, got %d", w.Code)
 	}
@@ -265,7 +268,7 @@ func TestPolicyValidationRejectsInvalidAllowedHours(t *testing.T) {
 
 func TestAuditEventsIncludeOwnedWorkerEvents(t *testing.T) {
 	app, h := newTestServer()
-	workerID, workerToken, policyID := setupWorkerConsent(t, h, app.apiToken)
+	workerID, workerToken, workerCertID, policyID := setupWorkerConsent(t, h, app.apiToken)
 
 	ts := time.Now().UTC().Format(time.RFC3339)
 	nonce := "audit-1"
@@ -275,7 +278,7 @@ func TestAuditEventsIncludeOwnedWorkerEvents(t *testing.T) {
 		"nonce":     nonce,
 		"policy_id": policyID,
 		"signature": sig,
-	}, map[string]string{"X-Machine-Token": workerToken})
+	}, map[string]string{"X-Machine-Token": workerToken, "X-Machine-Certificate-Id": workerCertID})
 	if w.Code != http.StatusOK {
 		t.Fatalf("heartbeat expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -306,9 +309,9 @@ func TestAuditEventsIncludeOwnedWorkerEvents(t *testing.T) {
 
 func TestWorkerPolicyEndpoint(t *testing.T) {
 	app, h := newTestServer()
-	workerID, workerToken, policyID := setupWorkerConsent(t, h, app.apiToken)
+	workerID, workerToken, workerCertID, policyID := setupWorkerConsent(t, h, app.apiToken)
 
-	w := doJSON(t, h, http.MethodGet, "/api/v1/workers/"+workerID+"/policy", nil, map[string]string{"X-Machine-Token": workerToken})
+	w := doJSON(t, h, http.MethodGet, "/api/v1/workers/"+workerID+"/policy", nil, map[string]string{"X-Machine-Token": workerToken, "X-Machine-Certificate-Id": workerCertID})
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -328,10 +331,15 @@ func TestWorkerPolicyEndpoint(t *testing.T) {
 }
 
 func TestMetricsEndpoint(t *testing.T) {
-	_, h := newTestServer()
+	app, h := newTestServer()
 	w := doJSON(t, h, http.MethodGet, "/metrics", nil, nil)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without auth, got %d", w.Code)
+	}
+
+	w = doJSON(t, h, http.MethodGet, "/metrics", nil, map[string]string{"Authorization": "Bearer " + app.apiToken})
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+		t.Fatalf("expected 200 with auth, got %d", w.Code)
 	}
 	body := w.Body.String()
 	if !strings.Contains(body, "hatchfarm_uptime_seconds") {
@@ -371,7 +379,7 @@ func TestIssueMachineCertificateEndpoint(t *testing.T) {
 	}
 }
 
-func setupWorkerConsent(t *testing.T, h http.Handler, token string) (workerID, workerToken, policyID string) {
+func setupWorkerConsent(t *testing.T, h http.Handler, token string) (workerID, workerToken, workerCertID, policyID string) {
 	t.Helper()
 	w := doJSON(t, h, http.MethodPost, "/api/v1/machines/register", map[string]string{"owner_id": "own_1", "name": "node-a"}, authHeader(token))
 	if w.Code != http.StatusCreated {
@@ -383,6 +391,9 @@ func setupWorkerConsent(t *testing.T, h http.Handler, token string) (workerID, w
 				ID string `json:"id"`
 			} `json:"machine"`
 			MachineToken string `json:"machine_token"`
+			MachineCert  struct {
+				CertificateID string `json:"certificate_id"`
+			} `json:"machine_certificate"`
 		} `json:"data"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&reg)
@@ -409,5 +420,5 @@ func setupWorkerConsent(t *testing.T, h http.Handler, token string) (workerID, w
 		t.Fatalf("consent expected 201, got %d", w.Code)
 	}
 
-	return reg.Data.Machine.ID, reg.Data.MachineToken, pol.Data.ID
+	return reg.Data.Machine.ID, reg.Data.MachineToken, reg.Data.MachineCert.CertificateID, pol.Data.ID
 }

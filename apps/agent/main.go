@@ -42,6 +42,9 @@ type RegisterResponse struct {
 			ID string `json:"id"`
 		} `json:"machine"`
 		MachineToken string `json:"machine_token"`
+		MachineCert  struct {
+			CertificateID string `json:"certificate_id"`
+		} `json:"machine_certificate"`
 	} `json:"data"`
 	Error string `json:"error"`
 }
@@ -74,13 +77,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	machineID, machineToken, err := registerMachineWithRetry(ctx, client, cfg)
+	machineID, machineToken, machineCertID, err := registerMachineWithRetry(ctx, client, cfg)
 	if err != nil {
 		log.Fatalf("register machine failed: %v", err)
 	}
 	log.Printf("registered machine_id=%s", machineID)
 
-	resolvedPolicyID, err := fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken)
+	resolvedPolicyID, err := fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
 	if err != nil {
 		log.Fatalf("worker policy sync failed: %v", err)
 	}
@@ -104,7 +107,7 @@ func main() {
 			return
 		case <-timer.C:
 			nextDelay := heartbeatInterval
-			if err := sendHeartbeat(ctx, client, cfg, machineID, machineToken); err != nil {
+			if err := sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID); err != nil {
 				consecutiveFails++
 				if consecutiveFails >= heartbeatMaxConsecutiveFails {
 					log.Fatalf("heartbeat failed %d times consecutively, exiting: %v", consecutiveFails, err)
@@ -154,12 +157,12 @@ func envIntOrDefault(key string, def int) int {
 	return n
 }
 
-func registerMachineWithRetry(ctx context.Context, client *http.Client, cfg AgentConfig) (machineID, machineToken string, err error) {
+func registerMachineWithRetry(ctx context.Context, client *http.Client, cfg AgentConfig) (machineID, machineToken, machineCertID string, err error) {
 	var lastErr error
 	for attempt := 1; attempt <= registerMaxAttempts; attempt++ {
-		machineID, machineToken, err = registerMachine(ctx, client, cfg)
+		machineID, machineToken, machineCertID, err = registerMachine(ctx, client, cfg)
 		if err == nil {
-			return machineID, machineToken, nil
+			return machineID, machineToken, machineCertID, nil
 		}
 		lastErr = err
 		if attempt == registerMaxAttempts {
@@ -170,19 +173,19 @@ func registerMachineWithRetry(ctx context.Context, client *http.Client, cfg Agen
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
-			return "", "", ctx.Err()
+			return "", "", "", ctx.Err()
 		}
 	}
-	return "", "", fmt.Errorf("register failed after retries: %w", lastErr)
+	return "", "", "", fmt.Errorf("register failed after retries: %w", lastErr)
 }
 
-func registerMachine(ctx context.Context, client *http.Client, cfg AgentConfig) (machineID, machineToken string, err error) {
+func registerMachine(ctx context.Context, client *http.Client, cfg AgentConfig) (machineID, machineToken, machineCertID string, err error) {
 	payload := map[string]string{"owner_id": cfg.OwnerID, "name": cfg.WorkerName}
 	body, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.APIBaseURL+"/api/v1/machines/register", bytes.NewReader(body))
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.OwnerToken)
@@ -190,29 +193,30 @@ func registerMachine(ctx context.Context, client *http.Client, cfg AgentConfig) 
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer resp.Body.Close()
 
 	var out RegisterResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	if resp.StatusCode >= 300 || !out.Success {
-		return "", "", fmt.Errorf("register failed: status=%d error=%s", resp.StatusCode, out.Error)
+		return "", "", "", fmt.Errorf("register failed: status=%d error=%s", resp.StatusCode, out.Error)
 	}
-	if out.Data.Machine.ID == "" || out.Data.MachineToken == "" {
-		return "", "", fmt.Errorf("register returned incomplete machine credentials")
+	if out.Data.Machine.ID == "" || out.Data.MachineToken == "" || out.Data.MachineCert.CertificateID == "" {
+		return "", "", "", fmt.Errorf("register returned incomplete machine credentials")
 	}
-	return out.Data.Machine.ID, out.Data.MachineToken, nil
+	return out.Data.Machine.ID, out.Data.MachineToken, out.Data.MachineCert.CertificateID, nil
 }
 
-func fetchWorkerPolicy(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken string) (string, error) {
+func fetchWorkerPolicy(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken, machineCertID string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.APIBaseURL+"/api/v1/workers/"+machineID+"/policy", nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("X-Machine-Token", machineToken)
+	req.Header.Set("X-Machine-Certificate-Id", machineCertID)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -233,7 +237,7 @@ func fetchWorkerPolicy(ctx context.Context, client *http.Client, cfg AgentConfig
 	return out.Data.Policy.ID, nil
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken string) error {
+func sendHeartbeat(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken, machineCertID string) error {
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 	nonce := randomID(12)
 	sig := signHeartbeat(machineToken, machineID, timestamp, nonce, cfg.PolicyID)
@@ -255,6 +259,7 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg AgentConfig, ma
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Machine-Token", machineToken)
+	req.Header.Set("X-Machine-Certificate-Id", machineCertID)
 
 	resp, err := client.Do(req)
 	if err != nil {

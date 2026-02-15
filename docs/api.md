@@ -21,7 +21,7 @@ https://api.hatchfarm.ai/v1
 - Owner APIs: `Authorization: Bearer <HATCHFARM_API_TOKEN>`
   - Sensitive owner-scoped routes also require `X-Owner-ID` header matching resource owner.
   - If token is missing, server generates an ephemeral token at boot and logs a warning (dev fallback only).
-- Worker heartbeat: `X-Machine-Token` + HMAC signature payload
+- Worker heartbeat: `X-Machine-Token` + `X-Machine-Certificate-Id` + HMAC signature payload
 - Policy/consent write requests: HMAC signatures validated server-side (dev baseline)
   - Policy signature payload: `owner_id|json(rules)`
   - Consent signature payload: `owner_id|worker_id|policy_id`
@@ -52,7 +52,8 @@ https://api.hatchfarm.ai/v1
 |--------|----------|-------------|
 | POST | /machines/register | Register provider machine (owner-auth required, returns token + short-lived machine certificate) |
 | POST | /machines/{id}/certificate | Issue/rotate short-lived machine certificate (owner-auth required) |
-| GET | /metrics | Basic Prometheus-style runtime metrics |
+| GET | /workers/{id}/policy | Worker policy fetch (requires machine token + certificate id) |
+| GET | /metrics | Basic Prometheus-style runtime metrics (auth required unless `METRICS_PUBLIC=true`) |
 | POST | /policies | Create signed policy draft (owner-auth required) |
 | POST | /policies/{id}/activate | Activate policy (owner-auth required) |
 | POST | /consents | Create consent binding owner+worker+policy (owner-auth required) |
