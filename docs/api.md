@@ -29,6 +29,8 @@ https://api.hatchfarm.ai/v1
 - Basic API protection: rate limiting + request body size limits
 - Transport guard: optional HTTPS enforcement (`REQUIRE_HTTPS=true`), with explicit proxy-header trust toggle (`TRUST_PROXY_HEADERS=true`)
 - Optional shared replay-state: set `REDIS_ADDR` (+ `REDIS_PASSWORD`) to store heartbeat nonces across API instances
+  - If Redis is configured and unavailable, default behavior is fail-closed (`503`) for heartbeat nonce reservation.
+  - Set `REDIS_NONCE_FALLBACK=true` to allow local fallback during Redis errors (higher availability, weaker cross-node replay guarantees).
 
 ---
 

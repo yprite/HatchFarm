@@ -110,13 +110,15 @@ type Store struct {
 }
 
 type App struct {
-	store          *Store
-	apiToken       string
-	allowedOrigins map[string]struct{}
-	startedAt      time.Time
-	rateMu         sync.Mutex
-	rateBuckets    map[string]*tokenBucket
-	redisClient    *redis.Client
+	store              *Store
+	apiToken           string
+	allowedOrigins     map[string]struct{}
+	startedAt          time.Time
+	rateMu             sync.Mutex
+	rateBuckets        map[string]*tokenBucket
+	redisClient        *redis.Client
+	workerLocks        sync.Map
+	localNonceFallback bool
 }
 
 func main() {
@@ -185,10 +187,11 @@ func newApp() *App {
 			nonces:           map[string]nonceRecord{},
 			lastNonceCleanup: time.Now().UTC(),
 		},
-		apiToken:       apiToken,
-		allowedOrigins: origins,
-		startedAt:      time.Now().UTC(),
-		rateBuckets:    map[string]*tokenBucket{},
+		apiToken:           apiToken,
+		allowedOrigins:     origins,
+		startedAt:          time.Now().UTC(),
+		rateBuckets:        map[string]*tokenBucket{},
+		localNonceFallback: strings.EqualFold(envOrDefault("REDIS_NONCE_FALLBACK", "false"), "true"),
 	}
 	app.redisClient = initRedisClient()
 	return app
@@ -457,6 +460,31 @@ func (a *App) revokeConsentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ownerID := ownerIDFromHeader(r)
+	if ownerID == "" {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+
+	a.store.mu.RLock()
+	consentRef, ok := a.store.consents[id]
+	if !ok {
+		a.store.mu.RUnlock()
+		writeError(w, http.StatusNotFound, "consent not found")
+		return
+	}
+	if ownerID != consentRef.OwnerID {
+		a.store.mu.RUnlock()
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	workerID := consentRef.WorkerID
+	a.store.mu.RUnlock()
+
+	wl := a.workerLock(workerID)
+	wl.Lock()
+	defer wl.Unlock()
+
 	a.store.mu.Lock()
 	defer a.store.mu.Unlock()
 	consent, ok := a.store.consents[id]
@@ -464,8 +492,7 @@ func (a *App) revokeConsentHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "consent not found")
 		return
 	}
-	ownerID := ownerIDFromHeader(r)
-	if ownerID == "" || ownerID != consent.OwnerID {
+	if ownerID != consent.OwnerID {
 		writeError(w, http.StatusForbidden, "forbidden")
 		return
 	}
@@ -549,6 +576,10 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	if a.redisClient != nil {
 		ok, err := a.reserveNonceRedis(r.Context(), nonceKey)
 		if err != nil {
+			if !a.localNonceFallback {
+				writeError(w, http.StatusServiceUnavailable, "nonce backend unavailable")
+				return
+			}
 			log.Printf("warning: redis nonce reserve failed, falling back to local nonce store: %v", err)
 			a.store.mu.Lock()
 			if !a.reserveNonceLocalLocked(now, nonceKey) {
@@ -571,7 +602,12 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		a.store.mu.Unlock()
 	}
 
-	// Re-check consent after nonce reservation to reduce revoke race window.
+	// Serialize final authorization/accept path with revoke for this worker.
+	wl := a.workerLock(workerID)
+	wl.Lock()
+	defer wl.Unlock()
+
+	// Re-check consent after nonce reservation while worker lock is held.
 	a.store.mu.RLock()
 	consentStillActive := false
 	for _, c := range a.store.consents {
@@ -629,7 +665,7 @@ func (a *App) auditEventsHandler(w http.ResponseWriter, r *http.Request) {
 	defer a.store.mu.RUnlock()
 	filtered := make([]*AuditEvent, 0, len(a.store.auditEvents))
 	for _, ev := range a.store.auditEvents {
-		if strings.HasPrefix(ev.Actor, "owner:"+ownerID) || ev.Actor == "worker:"+ownerID {
+		if ev.Actor == "owner:"+ownerID || ev.Actor == "worker:"+ownerID {
 			filtered = append(filtered, ev)
 		}
 	}
@@ -809,6 +845,11 @@ func requestIDFromHeader(r *http.Request) string {
 
 func ownerIDFromHeader(r *http.Request) string {
 	return strings.TrimSpace(r.Header.Get("X-Owner-ID"))
+}
+
+func (a *App) workerLock(workerID string) *sync.Mutex {
+	v, _ := a.workerLocks.LoadOrStore(workerID, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 func (a *App) authRequired(next http.HandlerFunc) http.HandlerFunc {
