@@ -9,7 +9,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,7 +21,16 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const (
+	version                  = "0.3.0"
+	maxBodyBytes             = 1 << 20 // 1MB
+	heartbeatMaxSkew         = 90 * time.Second
+	nonceReplayWindow        = 5 * time.Minute
+	rateLimitRefillPerSecond = 5.0
+	rateLimitBurst           = 20.0
+	rateBucketTTL            = 10 * time.Minute
+	maxRateBuckets           = 20000
+)
 
 type HealthResponse struct {
 	Status    string `json:"status"`
@@ -71,12 +82,23 @@ type AuditEvent struct {
 	CreatedAt time.Time              `json:"created_at"`
 }
 
+type nonceRecord struct {
+	SeenAt time.Time
+}
+
+type tokenBucket struct {
+	Tokens     float64
+	LastRefill time.Time
+	LastSeen   time.Time
+}
+
 type Store struct {
 	mu          sync.RWMutex
 	machines    map[string]*Machine
 	policies    map[string]*Policy
 	consents    map[string]*Consent
 	auditEvents []*AuditEvent
+	nonces      map[string]nonceRecord
 }
 
 type App struct {
@@ -84,6 +106,8 @@ type App struct {
 	apiToken       string
 	allowedOrigins map[string]struct{}
 	startedAt      time.Time
+	rateMu         sync.Mutex
+	rateBuckets    map[string]*tokenBucket
 }
 
 func main() {
@@ -96,7 +120,7 @@ func main() {
 	mux := app.routes()
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      app.corsMiddleware(app.loggingMiddleware(mux)),
+		Handler:      app.corsMiddleware(app.loggingMiddleware(app.bodyLimitMiddleware(app.rateLimitMiddleware(mux)))),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -128,7 +152,8 @@ func main() {
 func newApp() *App {
 	apiToken := os.Getenv("HATCHFARM_API_TOKEN")
 	if apiToken == "" {
-		apiToken = "dev-token"
+		apiToken = "boot_" + randomID(16)
+		log.Printf("warning: HATCHFARM_API_TOKEN not set; generated ephemeral token")
 	}
 
 	origins := map[string]struct{}{}
@@ -144,10 +169,12 @@ func newApp() *App {
 			machines: map[string]*Machine{},
 			policies: map[string]*Policy{},
 			consents: map[string]*Consent{},
+			nonces:   map[string]nonceRecord{},
 		},
 		apiToken:       apiToken,
 		allowedOrigins: origins,
 		startedAt:      time.Now().UTC(),
+		rateBuckets:    map[string]*tokenBucket{},
 	}
 }
 
@@ -200,8 +227,8 @@ func (a *App) registerMachineHandler(w http.ResponseWriter, r *http.Request) {
 		OwnerID string `json:"owner_id"`
 		Name    string `json:"name"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
 	if req.OwnerID == "" || req.Name == "" {
@@ -231,8 +258,8 @@ func (a *App) createPolicyHandler(w http.ResponseWriter, r *http.Request) {
 		Rules     map[string]interface{} `json:"rules"`
 		Signature string                 `json:"signature"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
 	if req.OwnerID == "" || req.Signature == "" {
@@ -311,8 +338,8 @@ func (a *App) createConsentHandler(w http.ResponseWriter, r *http.Request) {
 		PolicyID  string `json:"policy_id"`
 		Signature string `json:"signature"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
 	if req.OwnerID == "" || req.WorkerID == "" || req.PolicyID == "" || req.Signature == "" {
@@ -396,8 +423,8 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		Metrics   map[string]interface{} `json:"metrics"`
 		Signature string                 `json:"signature"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
 	machineToken := r.Header.Get("X-Machine-Token")
@@ -406,18 +433,37 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ts, err := time.Parse(time.RFC3339, req.Timestamp)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid timestamp")
+		return
+	}
+	now := time.Now().UTC()
+	if ts.Before(now.Add(-heartbeatMaxSkew)) || ts.After(now.Add(heartbeatMaxSkew)) {
+		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
+		return
+	}
+
 	a.store.mu.Lock()
 	defer a.store.mu.Unlock()
 	machine, ok := a.store.machines[workerID]
 	if !ok || machine.Secret != machineToken {
-		writeError(w, http.StatusUnauthorized, "invalid machine token")
+		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
 		return
 	}
 
 	if !verifyHeartbeatSignature(machine.Secret, workerID, req.Timestamp, req.Nonce, req.PolicyID, req.Signature) {
-		writeError(w, http.StatusUnauthorized, "invalid heartbeat signature")
+		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
 		return
 	}
+
+	a.cleanupNoncesLocked(now)
+	nonceKey := workerID + ":" + req.Nonce
+	if _, exists := a.store.nonces[nonceKey]; exists {
+		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
+		return
+	}
+	a.store.nonces[nonceKey] = nonceRecord{SeenAt: now}
 
 	consentActive := false
 	for _, c := range a.store.consents {
@@ -475,6 +521,26 @@ func verifyHeartbeatSignature(secret, workerID, timestamp, nonce, policyID, sign
 	return hmac.Equal([]byte(expected), []byte(signature))
 }
 
+func (a *App) cleanupNoncesLocked(now time.Time) {
+	for k, rec := range a.store.nonces {
+		if now.Sub(rec.SeenAt) > nonceReplayWindow {
+			delete(a.store.nonces, k)
+		}
+	}
+}
+
+func decodeJSON(r *http.Request, v interface{}) error {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("unexpected trailing json")
+	}
+	return nil
+}
+
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -490,7 +556,12 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 func (a *App) authRequired(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != a.apiToken {
+		if !strings.HasPrefix(auth, "Bearer ") {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		provided := strings.TrimPrefix(auth, "Bearer ")
+		if !hmac.Equal([]byte(provided), []byte(a.apiToken)) {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -504,6 +575,83 @@ func (a *App) loggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
 	})
+}
+
+func (a *App) bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		key := clientIP(r.RemoteAddr)
+		if key == "" {
+			key = "unknown"
+		}
+		if !a.allowRequest(key) {
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) allowRequest(key string) bool {
+	now := time.Now()
+	a.rateMu.Lock()
+	defer a.rateMu.Unlock()
+
+	a.cleanupRateBucketsLocked(now)
+
+	bucket, ok := a.rateBuckets[key]
+	if !ok {
+		if len(a.rateBuckets) >= maxRateBuckets {
+			return false
+		}
+		a.rateBuckets[key] = &tokenBucket{Tokens: rateLimitBurst - 1, LastRefill: now, LastSeen: now}
+		return true
+	}
+
+	elapsed := now.Sub(bucket.LastRefill).Seconds()
+	bucket.Tokens = minFloat(rateLimitBurst, bucket.Tokens+(elapsed*rateLimitRefillPerSecond))
+	bucket.LastRefill = now
+	bucket.LastSeen = now
+	if bucket.Tokens < 1 {
+		return false
+	}
+	bucket.Tokens -= 1
+	return true
+}
+
+func (a *App) cleanupRateBucketsLocked(now time.Time) {
+	for k, b := range a.rateBuckets {
+		if now.Sub(b.LastSeen) > rateBucketTTL {
+			delete(a.rateBuckets, k)
+		}
+	}
+}
+
+func clientIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err == nil {
+		return host
+	}
+	return remoteAddr
+}
+
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (a *App) corsMiddleware(next http.Handler) http.Handler {

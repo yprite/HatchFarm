@@ -17,9 +17,11 @@ https://api.hatchfarm.ai/v1
 - Moltbook OAuth
 - HatchFarm API Key
 
-### Current Dev Auth Baseline (v0.2)
+### Current Dev Auth Baseline (v0.3)
 - Owner APIs: `Authorization: Bearer <HATCHFARM_API_TOKEN>`
+  - If missing, server generates an ephemeral token at boot and logs a warning (dev fallback only).
 - Worker heartbeat: `X-Machine-Token` + HMAC signature payload
+- Heartbeat replay defense: timestamp skew window + nonce replay check
 
 ---
 

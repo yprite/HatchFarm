@@ -12,7 +12,8 @@ import (
 func newTestServer() (*App, http.Handler) {
 	app := newApp()
 	app.apiToken = "test-token"
-	return app, app.routes()
+	h := app.corsMiddleware(app.loggingMiddleware(app.bodyLimitMiddleware(app.rateLimitMiddleware(app.routes()))))
+	return app, h
 }
 
 func doJSON(t *testing.T, h http.Handler, method, path string, body interface{}, headers map[string]string) *httptest.ResponseRecorder {
@@ -157,8 +158,86 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 
 func TestHeartbeatRejectsBadSignature(t *testing.T) {
 	_, h := newTestServer()
+	workerID, workerToken, policyID := setupWorkerConsent(t, h)
 
+	w := doJSON(t, h, http.MethodPost, "/api/v1/workers/"+workerID+"/heartbeat", map[string]interface{}{
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"nonce":     "x",
+		"policy_id": policyID,
+		"signature": "bad-signature",
+	}, map[string]string{"X-Machine-Token": workerToken})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestHeartbeatRejectsReplayNonce(t *testing.T) {
+	_, h := newTestServer()
+	workerID, workerToken, policyID := setupWorkerConsent(t, h)
+
+	ts := time.Now().UTC().Format(time.RFC3339)
+	nonce := "replay-nonce"
+	sig := signHeartbeat(workerToken, workerID, ts, nonce, policyID)
+
+	w := doJSON(t, h, http.MethodPost, "/api/v1/workers/"+workerID+"/heartbeat", map[string]interface{}{
+		"timestamp": ts,
+		"nonce":     nonce,
+		"policy_id": policyID,
+		"signature": sig,
+	}, map[string]string{"X-Machine-Token": workerToken})
+	if w.Code != http.StatusOK {
+		t.Fatalf("first heartbeat expected 200, got %d", w.Code)
+	}
+
+	w = doJSON(t, h, http.MethodPost, "/api/v1/workers/"+workerID+"/heartbeat", map[string]interface{}{
+		"timestamp": ts,
+		"nonce":     nonce,
+		"policy_id": policyID,
+		"signature": sig,
+	}, map[string]string{"X-Machine-Token": workerToken})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("replay heartbeat expected 401, got %d", w.Code)
+	}
+}
+
+func TestHeartbeatRejectsStaleTimestamp(t *testing.T) {
+	_, h := newTestServer()
+	workerID, workerToken, policyID := setupWorkerConsent(t, h)
+
+	stale := time.Now().UTC().Add(-(heartbeatMaxSkew + 10*time.Second)).Format(time.RFC3339)
+	sig := signHeartbeat(workerToken, workerID, stale, "stale-1", policyID)
+	w := doJSON(t, h, http.MethodPost, "/api/v1/workers/"+workerID+"/heartbeat", map[string]interface{}{
+		"timestamp": stale,
+		"nonce":     "stale-1",
+		"policy_id": policyID,
+		"signature": sig,
+	}, map[string]string{"X-Machine-Token": workerToken})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("stale heartbeat expected 401, got %d", w.Code)
+	}
+}
+
+func TestRateLimitKicksIn(t *testing.T) {
+	_, h := newTestServer()
+	var got429 bool
+	for i := 0; i < 50; i++ {
+		w := doJSON(t, h, http.MethodGet, "/health", nil, nil)
+		if w.Code == http.StatusTooManyRequests {
+			got429 = true
+			break
+		}
+	}
+	if !got429 {
+		t.Fatal("expected at least one 429 response from rate limiter")
+	}
+}
+
+func setupWorkerConsent(t *testing.T, h http.Handler) (workerID, workerToken, policyID string) {
+	t.Helper()
 	w := doJSON(t, h, http.MethodPost, "/api/v1/machines/register", map[string]string{"owner_id": "own_1", "name": "node-a"}, authHeader())
+	if w.Code != http.StatusCreated {
+		t.Fatalf("register expected 201, got %d", w.Code)
+	}
 	var reg struct {
 		Data struct {
 			Machine struct {
@@ -170,22 +249,25 @@ func TestHeartbeatRejectsBadSignature(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&reg)
 
 	w = doJSON(t, h, http.MethodPost, "/api/v1/policies", map[string]interface{}{"owner_id": "own_1", "signature": "sig", "rules": map[string]interface{}{}}, authHeader())
+	if w.Code != http.StatusCreated {
+		t.Fatalf("policy create expected 201, got %d", w.Code)
+	}
 	var pol struct {
 		Data struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&pol)
-	_ = doJSON(t, h, http.MethodPost, "/api/v1/policies/"+pol.Data.ID+"/activate", nil, authHeader())
-	_ = doJSON(t, h, http.MethodPost, "/api/v1/consents", map[string]string{"owner_id": "own_1", "worker_id": reg.Data.Machine.ID, "policy_id": pol.Data.ID, "signature": "ok"}, authHeader())
 
-	w = doJSON(t, h, http.MethodPost, "/api/v1/workers/"+reg.Data.Machine.ID+"/heartbeat", map[string]interface{}{
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"nonce":     "x",
-		"policy_id": pol.Data.ID,
-		"signature": "bad-signature",
-	}, map[string]string{"X-Machine-Token": reg.Data.MachineToken})
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", w.Code)
+	w = doJSON(t, h, http.MethodPost, "/api/v1/policies/"+pol.Data.ID+"/activate", nil, authHeader())
+	if w.Code != http.StatusOK {
+		t.Fatalf("policy activate expected 200, got %d", w.Code)
 	}
+
+	w = doJSON(t, h, http.MethodPost, "/api/v1/consents", map[string]string{"owner_id": "own_1", "worker_id": reg.Data.Machine.ID, "policy_id": pol.Data.ID, "signature": "ok"}, authHeader())
+	if w.Code != http.StatusCreated {
+		t.Fatalf("consent expected 201, got %d", w.Code)
+	}
+
+	return reg.Data.Machine.ID, reg.Data.MachineToken, pol.Data.ID
 }
