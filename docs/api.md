@@ -17,11 +17,29 @@ https://api.hatchfarm.ai/v1
 - Moltbook OAuth
 - HatchFarm API Key
 
+### Current Dev Auth Baseline (v0.2)
+- Owner APIs: `Authorization: Bearer <HATCHFARM_API_TOKEN>`
+- Worker heartbeat: `X-Machine-Token` + HMAC signature payload
+
 ---
 
 ## Endpoints
 
-### Agents
+### Control Plane (Implemented baseline in API v0.2)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | /machines/register | Register provider machine (owner-auth required) |
+| POST | /policies | Create signed policy draft (owner-auth required) |
+| POST | /policies/{id}/activate | Activate policy (owner-auth required) |
+| POST | /consents | Create consent binding owner+worker+policy (owner-auth required) |
+| POST | /consents/{id}/revoke | Revoke consent (owner-auth required) |
+| POST | /workers/{id}/heartbeat | Worker heartbeat with machine token + signature |
+| GET | /audit/events | List audit events (owner-auth required) |
+
+> Note: Current code uses `/api/v1/*` prefix. Tables above omit prefix for readability.
+
+### Agents (Planned)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
