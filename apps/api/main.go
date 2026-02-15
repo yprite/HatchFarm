@@ -685,6 +685,7 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	machineToken := r.Header.Get("X-Machine-Token")
 	machineCertID := strings.TrimSpace(r.Header.Get("X-Machine-Certificate-Id"))
 	if machineToken == "" || machineCertID == "" || req.Timestamp == "" || req.Nonce == "" || req.PolicyID == "" || req.Signature == "" {
+		a.auditWorkerAuthFailure(workerID, "missing_heartbeat_fields")
 		writeError(w, http.StatusBadRequest, "missing required heartbeat fields")
 		return
 	}
@@ -704,17 +705,20 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	machine, ok := a.store.machines[workerID]
 	if !ok || machine.Secret != machineToken {
 		a.store.mu.RUnlock()
+		a.auditWorkerAuthFailure(workerID, "invalid_machine_token")
 		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
 		return
 	}
 	if !a.isMachineCertValidLocked(workerID, machineCertID, now) {
 		a.store.mu.RUnlock()
+		a.auditWorkerAuthFailure(workerID, "invalid_or_expired_machine_cert")
 		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
 		return
 	}
 
 	if !verifyHeartbeatSignature(machine.Secret, workerID, req.Timestamp, req.Nonce, req.PolicyID, req.Signature) {
 		a.store.mu.RUnlock()
+		a.auditWorkerAuthFailure(workerID, "invalid_heartbeat_signature")
 		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
 		return
 	}
@@ -852,6 +856,7 @@ func (a *App) workerPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	machineToken := strings.TrimSpace(r.Header.Get("X-Machine-Token"))
 	machineCertID := strings.TrimSpace(r.Header.Get("X-Machine-Certificate-Id"))
 	if machineToken == "" || machineCertID == "" {
+		a.auditWorkerAuthFailure(workerID, "missing_worker_policy_auth_headers")
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -861,10 +866,12 @@ func (a *App) workerPolicyHandler(w http.ResponseWriter, r *http.Request) {
 
 	machine, ok := a.store.machines[workerID]
 	if !ok || machine.Secret != machineToken {
+		a.auditWorkerAuthFailure(workerID, "invalid_machine_token_policy_fetch")
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	if !a.isMachineCertValidLocked(workerID, machineCertID, time.Now().UTC()) {
+		a.auditWorkerAuthFailure(workerID, "invalid_or_expired_machine_cert_policy_fetch")
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -971,6 +978,12 @@ func (a *App) appendAuditLocked(eventType, actor, objectID string, metadata map[
 	if len(a.store.auditEvents) > maxAuditEvents {
 		a.store.auditEvents = append([]*AuditEvent(nil), a.store.auditEvents[len(a.store.auditEvents)-maxAuditEvents:]...)
 	}
+}
+
+func (a *App) auditWorkerAuthFailure(workerID, reason string) {
+	a.store.mu.Lock()
+	defer a.store.mu.Unlock()
+	a.appendAuditLocked("worker_auth_failed", "worker:"+workerID, workerID, map[string]interface{}{"reason": reason})
 }
 
 func randomID(size int) string {

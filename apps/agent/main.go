@@ -74,6 +74,24 @@ type WorkerPolicyResponse struct {
 	Error string `json:"error"`
 }
 
+type CertificateIssueResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		CertificateID string `json:"certificate_id"`
+		MachineID     string `json:"machine_id"`
+	} `json:"data"`
+	Error string `json:"error"`
+}
+
+type apiCallError struct {
+	Status  int
+	Message string
+}
+
+func (e *apiCallError) Error() string {
+	return fmt.Sprintf("status=%d message=%s", e.Status, e.Message)
+}
+
 func main() {
 	cfg := loadConfig()
 
@@ -105,6 +123,16 @@ func main() {
 	}
 
 	resolvedPolicyID, err := fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
+	if err != nil {
+		if apiErr, ok := err.(*apiCallError); ok && apiErr.Status == http.StatusUnauthorized {
+			log.Printf("policy sync unauthorized, rotating certificate")
+			newCertID, certErr := rotateMachineCertificate(ctx, client, cfg, machineID)
+			if certErr == nil {
+				machineCertID = newCertID
+				resolvedPolicyID, err = fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
+			}
+		}
+	}
 	if err != nil {
 		log.Printf("policy sync with saved/issued credentials failed, re-registering: %v", err)
 		machineID, machineToken, machineCertID, err = registerMachineWithRetry(ctx, client, cfg)
@@ -145,7 +173,20 @@ func main() {
 			return
 		case <-timer.C:
 			nextDelay := heartbeatInterval
-			if err := sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID); err != nil {
+			err := sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID)
+			if apiErr, ok := err.(*apiCallError); ok && apiErr.Status == http.StatusUnauthorized {
+				newCertID, certErr := rotateMachineCertificate(ctx, client, cfg, machineID)
+				if certErr == nil {
+					machineCertID = newCertID
+					err = sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID)
+					if err == nil {
+						if saveErr := saveState(cfg.StateFile, AgentState{MachineID: machineID, MachineToken: machineToken, MachineCertID: machineCertID, PolicyID: cfg.PolicyID, UpdatedAt: time.Now().UTC()}); saveErr != nil {
+							log.Printf("warning: failed to persist rotated cert state: %v", saveErr)
+						}
+					}
+				}
+			}
+			if err != nil {
 				consecutiveFails++
 				if consecutiveFails >= heartbeatMaxConsecutiveFails {
 					log.Fatalf("heartbeat failed %d times consecutively, exiting: %v", consecutiveFails, err)
@@ -249,6 +290,33 @@ func registerMachine(ctx context.Context, client *http.Client, cfg AgentConfig) 
 	return out.Data.Machine.ID, out.Data.MachineToken, out.Data.MachineCert.CertificateID, nil
 }
 
+func rotateMachineCertificate(ctx context.Context, client *http.Client, cfg AgentConfig, machineID string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.APIBaseURL+"/api/v1/machines/"+machineID+"/certificate", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.OwnerToken)
+	req.Header.Set("X-Owner-ID", cfg.OwnerID)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var out CertificateIssueResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= 300 || !out.Success {
+		return "", &apiCallError{Status: resp.StatusCode, Message: out.Error}
+	}
+	if out.Data.CertificateID == "" {
+		return "", fmt.Errorf("certificate rotation returned empty certificate id")
+	}
+	return out.Data.CertificateID, nil
+}
+
 func fetchWorkerPolicy(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken, machineCertID string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.APIBaseURL+"/api/v1/workers/"+machineID+"/policy", nil)
 	if err != nil {
@@ -268,7 +336,7 @@ func fetchWorkerPolicy(ctx context.Context, client *http.Client, cfg AgentConfig
 		return "", err
 	}
 	if resp.StatusCode >= 300 || !out.Success {
-		return "", fmt.Errorf("worker policy fetch failed: status=%d error=%s", resp.StatusCode, out.Error)
+		return "", &apiCallError{Status: resp.StatusCode, Message: out.Error}
 	}
 	if out.Data.Policy.ID == "" {
 		return "", fmt.Errorf("worker policy fetch returned empty policy id")
@@ -311,7 +379,7 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg AgentConfig, ma
 		return err
 	}
 	if resp.StatusCode >= 300 || !out.Success {
-		return fmt.Errorf("heartbeat failed: status=%d error=%s", resp.StatusCode, out.Error)
+		return &apiCallError{Status: resp.StatusCode, Message: out.Error}
 	}
 	return nil
 }

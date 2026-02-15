@@ -31,4 +31,6 @@ go run .
   - HTTP client timeout (10s)
   - machine register retry with exponential backoff
   - heartbeat retry backoff with capped consecutive failure exit
-- This is a baseline runtime loop for Sprint 01; policy sync, attestation, and update orchestration are planned next.
+  - on worker auth failure (401), cert rotation is attempted and heartbeat is retried once
+  - local state persistence/reuse across restarts (`AGENT_STATE_FILE`)
+- This is an evolving Sprint 2 runtime loop; attestation and update orchestration are planned next.

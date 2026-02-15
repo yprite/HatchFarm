@@ -22,6 +22,7 @@ https://api.hatchfarm.ai/v1
   - Sensitive owner-scoped routes also require `X-Owner-ID` header matching resource owner.
   - If token is missing, server generates an ephemeral token at boot and logs a warning (dev fallback only).
 - Worker heartbeat: `X-Machine-Token` + `X-Machine-Certificate-Id` + HMAC signature payload
+- Failed worker auth attempts are recorded to audit stream as `worker_auth_failed`
 - Policy/consent write requests: HMAC signatures validated server-side (dev baseline)
   - Policy signature payload: `owner_id|json(rules)`
   - Consent signature payload: `owner_id|worker_id|policy_id`
