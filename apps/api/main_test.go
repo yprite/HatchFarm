@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 func newTestServer() (*App, http.Handler) {
 	app := newApp()
 	app.apiToken = "test-" + randomID(8)
+	app.workerStatusStateFile = ""
 	h := app.corsMiddleware(app.requestIDMiddleware(app.loggingMiddleware(app.tlsEnforcementMiddleware(app.bodyLimitMiddleware(app.rateLimitMiddleware(app.routes()))))))
 	return app, h
 }
@@ -410,6 +412,40 @@ func TestIssueMachineCertificateEndpoint(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&certResp)
 	if certResp.Data.CertificateID == "" || certResp.Data.MachineID != reg.Data.Machine.ID {
 		t.Fatalf("invalid certificate payload")
+	}
+}
+
+func TestWorkerStatusStatePersistenceRoundtrip(t *testing.T) {
+	app, _ := newTestServer()
+	stateFile := t.TempDir() + "/worker-status.json"
+	app.workerStatusStateFile = stateFile
+
+	now := time.Now().UTC()
+	app.store.mu.Lock()
+	app.store.workerStatus["wrk_1"] = &WorkerStatus{WorkerID: "wrk_1", LastHeartbeat: now, PolicyID: "pol_1", UpdatedAt: now}
+	app.store.mu.Unlock()
+
+	if err := app.saveWorkerStatusState(); err != nil {
+		t.Fatalf("save worker status: %v", err)
+	}
+
+	other, _ := newTestServer()
+	other.workerStatusStateFile = stateFile
+	if err := other.loadWorkerStatusState(); err != nil {
+		t.Fatalf("load worker status: %v", err)
+	}
+
+	other.store.mu.RLock()
+	defer other.store.mu.RUnlock()
+	got, ok := other.store.workerStatus["wrk_1"]
+	if !ok {
+		t.Fatal("expected persisted worker status")
+	}
+	if got.PolicyID != "pol_1" {
+		t.Fatalf("unexpected policy id: %s", got.PolicyID)
+	}
+	if _, err := os.Stat(stateFile); err != nil {
+		t.Fatalf("expected state file to exist: %v", err)
 	}
 }
 

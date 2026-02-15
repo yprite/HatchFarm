@@ -142,6 +142,7 @@ type App struct {
 	redisRateLimitWindow   time.Duration
 	redisRateLimitMax      int
 	metricsPublic          bool
+	workerStatusStateFile  string
 }
 
 func main() {
@@ -178,6 +179,9 @@ func main() {
 
 	if err := server.Shutdown(ctx); err != nil {
 		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+	if err := app.saveWorkerStatusState(); err != nil {
+		log.Printf("warning: failed to save worker status state on shutdown: %v", err)
 	}
 
 	log.Println("Server exited")
@@ -222,8 +226,12 @@ func newApp() *App {
 		redisRateLimitWindow:   time.Duration(envIntOrDefault("REDIS_RATE_LIMIT_WINDOW_SECONDS", 1)) * time.Second,
 		redisRateLimitMax:      envIntOrDefault("REDIS_RATE_LIMIT_MAX_REQUESTS", int(rateLimitBurst)),
 		metricsPublic:          strings.EqualFold(envOrDefault("METRICS_PUBLIC", "false"), "true"),
+		workerStatusStateFile:  envOrDefault("WORKER_STATUS_STATE_FILE", ".worker_status_state.json"),
 	}
 	app.redisClient = initRedisClient()
+	if err := app.loadWorkerStatusState(); err != nil {
+		log.Printf("warning: failed to load worker status state: %v", err)
+	}
 	return app
 }
 
@@ -795,6 +803,9 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	a.appendAuditLocked("worker_heartbeat", "worker:"+workerID, workerID, map[string]interface{}{"policy_id": req.PolicyID})
 	a.store.mu.Unlock()
+	if err := a.saveWorkerStatusState(); err != nil {
+		log.Printf("warning: failed to persist worker status: %v", err)
+	}
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"worker_id": workerID, "accepted": true}})
 }
 
@@ -984,6 +995,62 @@ func (a *App) auditWorkerAuthFailure(workerID, reason string) {
 	a.store.mu.Lock()
 	defer a.store.mu.Unlock()
 	a.appendAuditLocked("worker_auth_failed", "worker:"+workerID, workerID, map[string]interface{}{"reason": reason})
+}
+
+func (a *App) saveWorkerStatusState() error {
+	if strings.TrimSpace(a.workerStatusStateFile) == "" {
+		return nil
+	}
+	a.store.mu.RLock()
+	snapshot := make(map[string]*WorkerStatus, len(a.store.workerStatus))
+	for k, v := range a.store.workerStatus {
+		if v == nil {
+			continue
+		}
+		c := *v
+		snapshot[k] = &c
+	}
+	a.store.mu.RUnlock()
+	b, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(a.workerStatusStateFile, b, 0o600)
+}
+
+func (a *App) loadWorkerStatusState() error {
+	path := strings.TrimSpace(a.workerStatusStateFile)
+	if path == "" {
+		return nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if len(bytesTrimSpace(b)) == 0 {
+		return nil
+	}
+	var state map[string]*WorkerStatus
+	if err := json.Unmarshal(b, &state); err != nil {
+		return err
+	}
+	a.store.mu.Lock()
+	defer a.store.mu.Unlock()
+	for k, v := range state {
+		if k == "" || v == nil || v.WorkerID == "" {
+			continue
+		}
+		c := *v
+		a.store.workerStatus[k] = &c
+	}
+	return nil
+}
+
+func bytesTrimSpace(in []byte) []byte {
+	return []byte(strings.TrimSpace(string(in)))
 }
 
 func randomID(size int) string {

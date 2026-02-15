@@ -42,6 +42,8 @@ https://api.hatchfarm.ai/v1
   - `REDIS_RATE_LIMIT_WINDOW_SECONDS` (default `1`)
   - `REDIS_RATE_LIMIT_MAX_REQUESTS` (default `20`)
   - `REDIS_RATE_LIMIT_FALLBACK` (default `true`): if Redis limiter fails, fallback to local limiter
+- Worker status persistence:
+  - `WORKER_STATUS_STATE_FILE` (default `.worker_status_state.json`) persists worker heartbeat status across API restarts
 
 ---
 
