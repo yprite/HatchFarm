@@ -22,21 +22,20 @@ jobs:
       - run: go build ./...
       - run: go test ./...
 
-  # TODO: Enable when agent code is ready
-  # agent:
-  #   name: Agent (Go)
-  #   runs-on: ubuntu-latest
-  #   defaults:
-  #     run:
-  #       working-directory: ./apps/agent
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-go@v5
-  #       with:
-  #         go-version: '1.22'
-  #     - run: go mod download
-  #     - run: go build ./...
-  #     - run: go test ./...
+  agent:
+    name: Agent (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./apps/agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - run: go mod download
+      - run: go build ./...
+      - run: go test ./...
 
   # TODO: Enable when web app is ready
   # web:
