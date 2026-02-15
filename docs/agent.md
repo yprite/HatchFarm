@@ -1,0 +1,27 @@
+# HatchFarm Agent (Baseline)
+
+`apps/agent` now includes a minimal daemon that:
+1. Registers a machine (`/api/v1/machines/register`)
+2. Sends periodic signed heartbeats (`/api/v1/workers/{id}/heartbeat`)
+
+## Environment Variables
+
+- `AGENT_API_BASE_URL` (default: `http://localhost:8080`)
+- `AGENT_OWNER_TOKEN` (required)
+- `AGENT_OWNER_ID` (required)
+- `AGENT_POLICY_ID` (required)
+- `AGENT_WORKER_NAME` (default: `agent-node`)
+- `AGENT_HEARTBEAT_SECONDS` (default: `15`)
+
+## Run
+
+```bash
+cd apps/agent
+go run .
+```
+
+## Notes
+
+- Heartbeat signature format matches API server expectation:
+  `HMAC(machine_token, worker_id|timestamp|nonce|policy_id)`
+- This is a baseline runtime loop for Sprint 01; policy sync, attestation, and update orchestration are planned next.
