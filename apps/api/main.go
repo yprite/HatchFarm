@@ -20,6 +20,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -114,6 +116,7 @@ type App struct {
 	startedAt      time.Time
 	rateMu         sync.Mutex
 	rateBuckets    map[string]*tokenBucket
+	redisClient    *redis.Client
 }
 
 func main() {
@@ -174,7 +177,7 @@ func newApp() *App {
 		}
 	}
 
-	return &App{
+	app := &App{
 		store: &Store{
 			machines:         map[string]*Machine{},
 			policies:         map[string]*Policy{},
@@ -187,6 +190,8 @@ func newApp() *App {
 		startedAt:      time.Now().UTC(),
 		rateBuckets:    map[string]*tokenBucket{},
 	}
+	app.redisClient = initRedisClient()
+	return app
 }
 
 func envOrDefault(key, def string) string {
@@ -194,6 +199,27 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func initRedisClient() *redis.Client {
+	addr := strings.TrimSpace(os.Getenv("REDIS_ADDR"))
+	if addr == "" {
+		return nil
+	}
+	client := redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: os.Getenv("REDIS_PASSWORD"),
+		DB:       0,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		log.Printf("warning: redis disabled (ping failed): %v", err)
+		_ = client.Close()
+		return nil
+	}
+	log.Printf("redis enabled for shared nonce state")
+	return client
 }
 
 func (a *App) routes() *http.ServeMux {
@@ -492,26 +518,19 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.store.mu.Lock()
-	defer a.store.mu.Unlock()
+	a.store.mu.RLock()
 	machine, ok := a.store.machines[workerID]
 	if !ok || machine.Secret != machineToken {
+		a.store.mu.RUnlock()
 		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
 		return
 	}
 
 	if !verifyHeartbeatSignature(machine.Secret, workerID, req.Timestamp, req.Nonce, req.PolicyID, req.Signature) {
+		a.store.mu.RUnlock()
 		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
 		return
 	}
-
-	a.maybeCleanupNoncesLocked(now)
-	nonceKey := workerID + ":" + req.Nonce
-	if _, exists := a.store.nonces[nonceKey]; exists {
-		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
-		return
-	}
-	a.store.nonces[nonceKey] = nonceRecord{SeenAt: now}
 
 	consentActive := false
 	for _, c := range a.store.consents {
@@ -520,12 +539,56 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	a.store.mu.RUnlock()
 	if !consentActive {
 		writeError(w, http.StatusForbidden, "no active consent for worker/policy")
 		return
 	}
 
+	nonceKey := workerID + ":" + req.Nonce
+	if a.redisClient != nil {
+		ok, err := a.reserveNonceRedis(r.Context(), nonceKey)
+		if err != nil {
+			log.Printf("warning: redis nonce reserve failed, falling back to local nonce store: %v", err)
+			a.store.mu.Lock()
+			if !a.reserveNonceLocalLocked(now, nonceKey) {
+				a.store.mu.Unlock()
+				writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
+				return
+			}
+			a.store.mu.Unlock()
+		} else if !ok {
+			writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
+			return
+		}
+	} else {
+		a.store.mu.Lock()
+		if !a.reserveNonceLocalLocked(now, nonceKey) {
+			a.store.mu.Unlock()
+			writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
+			return
+		}
+		a.store.mu.Unlock()
+	}
+
+	// Re-check consent after nonce reservation to reduce revoke race window.
+	a.store.mu.RLock()
+	consentStillActive := false
+	for _, c := range a.store.consents {
+		if c.WorkerID == workerID && c.PolicyID == req.PolicyID && c.RevokedAt == nil {
+			consentStillActive = true
+			break
+		}
+	}
+	a.store.mu.RUnlock()
+	if !consentStillActive {
+		writeError(w, http.StatusForbidden, "no active consent for worker/policy")
+		return
+	}
+
+	a.store.mu.Lock()
 	a.appendAuditLocked("worker_heartbeat", "worker:"+workerID, workerID, map[string]interface{}{"policy_id": req.PolicyID})
+	a.store.mu.Unlock()
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"worker_id": workerID, "accepted": true}})
 }
 
@@ -684,6 +747,24 @@ func (a *App) maybeCleanupNoncesLocked(now time.Time) {
 		}
 	}
 	a.store.lastNonceCleanup = now
+}
+
+func (a *App) reserveNonceLocalLocked(now time.Time, nonceKey string) bool {
+	a.maybeCleanupNoncesLocked(now)
+	if _, exists := a.store.nonces[nonceKey]; exists {
+		return false
+	}
+	a.store.nonces[nonceKey] = nonceRecord{SeenAt: now}
+	return true
+}
+
+func (a *App) reserveNonceRedis(ctx context.Context, nonceKey string) (bool, error) {
+	if a.redisClient == nil {
+		return false, nil
+	}
+	key := "hf:nonce:" + nonceKey
+	ok, err := a.redisClient.SetNX(ctx, key, "1", nonceReplayWindow).Result()
+	return ok, err
 }
 
 func decodeJSON(r *http.Request, v interface{}) error {

@@ -28,6 +28,7 @@ https://api.hatchfarm.ai/v1
 - Heartbeat replay defense: timestamp skew window + nonce replay check
 - Basic API protection: rate limiting + request body size limits
 - Transport guard: optional HTTPS enforcement (`REQUIRE_HTTPS=true`), with explicit proxy-header trust toggle (`TRUST_PROXY_HEADERS=true`)
+- Optional shared replay-state: set `REDIS_ADDR` (+ `REDIS_PASSWORD`) to store heartbeat nonces across API instances
 
 ---
 
