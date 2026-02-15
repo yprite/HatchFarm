@@ -36,6 +36,11 @@ https://api.hatchfarm.ai/v1
 - Optional shared replay-state: set `REDIS_ADDR` (+ `REDIS_PASSWORD`) to store heartbeat nonces across API instances
   - If Redis is configured and unavailable, default behavior is fail-closed (`503`) for heartbeat nonce reservation.
   - Set `REDIS_NONCE_FALLBACK=true` to allow local fallback during Redis errors (higher availability, weaker cross-node replay guarantees).
+- Optional shared Redis rate limit:
+  - `REDIS_RATE_LIMIT_ENABLED=true`
+  - `REDIS_RATE_LIMIT_WINDOW_SECONDS` (default `1`)
+  - `REDIS_RATE_LIMIT_MAX_REQUESTS` (default `20`)
+  - `REDIS_RATE_LIMIT_FALLBACK` (default `true`): if Redis limiter fails, fallback to local limiter
 
 ---
 

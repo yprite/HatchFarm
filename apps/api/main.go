@@ -110,15 +110,19 @@ type Store struct {
 }
 
 type App struct {
-	store              *Store
-	apiToken           string
-	allowedOrigins     map[string]struct{}
-	startedAt          time.Time
-	rateMu             sync.Mutex
-	rateBuckets        map[string]*tokenBucket
-	redisClient        *redis.Client
-	workerLocks        sync.Map
-	localNonceFallback bool
+	store                  *Store
+	apiToken               string
+	allowedOrigins         map[string]struct{}
+	startedAt              time.Time
+	rateMu                 sync.Mutex
+	rateBuckets            map[string]*tokenBucket
+	redisClient            *redis.Client
+	workerLocks            sync.Map
+	localNonceFallback     bool
+	redisRateLimitEnabled  bool
+	redisRateLimitFallback bool
+	redisRateLimitWindow   time.Duration
+	redisRateLimitMax      int
 }
 
 func main() {
@@ -187,11 +191,15 @@ func newApp() *App {
 			nonces:           map[string]nonceRecord{},
 			lastNonceCleanup: time.Now().UTC(),
 		},
-		apiToken:           apiToken,
-		allowedOrigins:     origins,
-		startedAt:          time.Now().UTC(),
-		rateBuckets:        map[string]*tokenBucket{},
-		localNonceFallback: strings.EqualFold(envOrDefault("REDIS_NONCE_FALLBACK", "false"), "true"),
+		apiToken:               apiToken,
+		allowedOrigins:         origins,
+		startedAt:              time.Now().UTC(),
+		rateBuckets:            map[string]*tokenBucket{},
+		localNonceFallback:     strings.EqualFold(envOrDefault("REDIS_NONCE_FALLBACK", "false"), "true"),
+		redisRateLimitEnabled:  strings.EqualFold(envOrDefault("REDIS_RATE_LIMIT_ENABLED", "false"), "true"),
+		redisRateLimitFallback: strings.EqualFold(envOrDefault("REDIS_RATE_LIMIT_FALLBACK", "true"), "true"),
+		redisRateLimitWindow:   time.Duration(envIntOrDefault("REDIS_RATE_LIMIT_WINDOW_SECONDS", 1)) * time.Second,
+		redisRateLimitMax:      envIntOrDefault("REDIS_RATE_LIMIT_MAX_REQUESTS", int(rateLimitBurst)),
 	}
 	app.redisClient = initRedisClient()
 	return app
@@ -200,6 +208,15 @@ func newApp() *App {
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func envIntOrDefault(key string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
 	}
 	return def
 }
@@ -972,15 +989,60 @@ func (a *App) rateLimitMiddleware(next http.Handler) http.Handler {
 		if key == "" {
 			key = "unknown"
 		}
-		if !a.allowRequest(key) {
-			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		allowed, denyStatus := a.allowRequest(r.Context(), key)
+		if !allowed {
+			status := denyStatus
+			if status == 0 {
+				status = http.StatusTooManyRequests
+			}
+			writeError(w, status, "rate limit exceeded")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-func (a *App) allowRequest(key string) bool {
+func (a *App) allowRequest(ctx context.Context, key string) (bool, int) {
+	if a.redisRateLimitEnabled && a.redisClient != nil {
+		ok, err := a.allowRequestRedis(ctx, key)
+		if err == nil {
+			if !ok {
+				return false, http.StatusTooManyRequests
+			}
+			return true, 0
+		}
+		if !a.redisRateLimitFallback {
+			log.Printf("warning: redis rate limit backend unavailable: %v", err)
+			return false, http.StatusServiceUnavailable
+		}
+		log.Printf("warning: redis rate limit failed, falling back local: %v", err)
+	}
+
+	ok := a.allowRequestLocal(key)
+	if !ok {
+		return false, http.StatusTooManyRequests
+	}
+	return true, 0
+}
+
+func (a *App) allowRequestRedis(ctx context.Context, key string) (bool, error) {
+	windowSec := int(a.redisRateLimitWindow.Seconds())
+	if windowSec < 1 {
+		windowSec = 1
+	}
+	nowSec := time.Now().Unix()
+	redisKey := fmt.Sprintf("hf:rl:%s:%d", key, nowSec)
+
+	pipe := a.redisClient.TxPipeline()
+	incr := pipe.Incr(ctx, redisKey)
+	pipe.Expire(ctx, redisKey, time.Duration(windowSec)*time.Second)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return false, err
+	}
+	return int(incr.Val()) <= a.redisRateLimitMax, nil
+}
+
+func (a *App) allowRequestLocal(key string) bool {
 	now := time.Now()
 	a.rateMu.Lock()
 	defer a.rateMu.Unlock()
