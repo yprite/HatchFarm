@@ -51,6 +51,17 @@ type APIResponse struct {
 	Error   string `json:"error"`
 }
 
+type WorkerPolicyResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		WorkerID string `json:"worker_id"`
+		Policy   struct {
+			ID string `json:"id"`
+		} `json:"policy"`
+	} `json:"data"`
+	Error string `json:"error"`
+}
+
 func main() {
 	cfg := loadConfig()
 
@@ -68,6 +79,14 @@ func main() {
 		log.Fatalf("register machine failed: %v", err)
 	}
 	log.Printf("registered machine_id=%s", machineID)
+
+	resolvedPolicyID, err := fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken)
+	if err != nil {
+		log.Fatalf("worker policy sync failed: %v", err)
+	}
+	if resolvedPolicyID != cfg.PolicyID {
+		log.Fatalf("worker policy mismatch: expected=%s got=%s", cfg.PolicyID, resolvedPolicyID)
+	}
 
 	heartbeatInterval := time.Duration(cfg.HeartbeatSeconds) * time.Second
 	if heartbeatInterval <= 0 {
@@ -186,6 +205,32 @@ func registerMachine(ctx context.Context, client *http.Client, cfg AgentConfig) 
 		return "", "", fmt.Errorf("register returned incomplete machine credentials")
 	}
 	return out.Data.Machine.ID, out.Data.MachineToken, nil
+}
+
+func fetchWorkerPolicy(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.APIBaseURL+"/api/v1/workers/"+machineID+"/policy", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-Machine-Token", machineToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var out WorkerPolicyResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= 300 || !out.Success {
+		return "", fmt.Errorf("worker policy fetch failed: status=%d error=%s", resp.StatusCode, out.Error)
+	}
+	if out.Data.Policy.ID == "" {
+		return "", fmt.Errorf("worker policy fetch returned empty policy id")
+	}
+	return out.Data.Policy.ID, nil
 }
 
 func sendHeartbeat(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken string) error {

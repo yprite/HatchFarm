@@ -303,6 +303,29 @@ func TestAuditEventsIncludeOwnedWorkerEvents(t *testing.T) {
 	}
 }
 
+func TestWorkerPolicyEndpoint(t *testing.T) {
+	app, h := newTestServer()
+	workerID, workerToken, policyID := setupWorkerConsent(t, h, app.apiToken)
+
+	w := doJSON(t, h, http.MethodGet, "/api/v1/workers/"+workerID+"/policy", nil, map[string]string{"X-Machine-Token": workerToken})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			WorkerID string `json:"worker_id"`
+			Policy   struct {
+				ID string `json:"id"`
+			} `json:"policy"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Data.WorkerID != workerID || resp.Data.Policy.ID != policyID {
+		t.Fatalf("unexpected policy payload worker=%s policy=%s", resp.Data.WorkerID, resp.Data.Policy.ID)
+	}
+}
+
 func setupWorkerConsent(t *testing.T, h http.Handler, token string) (workerID, workerToken, policyID string) {
 	t.Helper()
 	w := doJSON(t, h, http.MethodPost, "/api/v1/machines/register", map[string]string{"owner_id": "own_1", "name": "node-a"}, authHeader(token))

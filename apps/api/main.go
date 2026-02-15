@@ -251,7 +251,7 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("/api/v1/policies/", a.authRequired(a.activatePolicyHandler))
 	mux.HandleFunc("/api/v1/consents", a.authRequired(a.createConsentHandler))
 	mux.HandleFunc("/api/v1/consents/", a.authRequired(a.revokeConsentHandler))
-	mux.HandleFunc("/api/v1/workers/", a.heartbeatHandler)
+	mux.HandleFunc("/api/v1/workers/", a.workerHandler)
 	mux.HandleFunc("/api/v1/audit/events", a.authRequired(a.auditEventsHandler))
 	return mux
 }
@@ -519,6 +519,18 @@ func (a *App) revokeConsentHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: consent})
 }
 
+func (a *App) workerHandler(w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+		a.heartbeatHandler(w, r)
+		return
+	}
+	if strings.HasSuffix(r.URL.Path, "/policy") {
+		a.workerPolicyHandler(w, r)
+		return
+	}
+	writeError(w, http.StatusNotFound, "not found")
+}
+
 func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -643,6 +655,61 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	a.appendAuditLocked("worker_heartbeat", "worker:"+workerID, workerID, map[string]interface{}{"policy_id": req.PolicyID})
 	a.store.mu.Unlock()
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"worker_id": workerID, "accepted": true}})
+}
+
+func (a *App) workerPolicyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !strings.HasSuffix(r.URL.Path, "/policy") {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	workerID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/workers/"), "/policy")
+	if workerID == "" {
+		writeError(w, http.StatusBadRequest, "worker id is required")
+		return
+	}
+	machineToken := strings.TrimSpace(r.Header.Get("X-Machine-Token"))
+	if machineToken == "" {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	a.store.mu.RLock()
+	defer a.store.mu.RUnlock()
+
+	machine, ok := a.store.machines[workerID]
+	if !ok || machine.Secret != machineToken {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var latestConsent *Consent
+	for _, c := range a.store.consents {
+		if c.WorkerID != workerID || c.RevokedAt != nil {
+			continue
+		}
+		if latestConsent == nil || c.EffectiveAt.After(latestConsent.EffectiveAt) {
+			latestConsent = c
+		}
+	}
+	if latestConsent == nil {
+		writeError(w, http.StatusForbidden, "no active consent")
+		return
+	}
+
+	policy, ok := a.store.policies[latestConsent.PolicyID]
+	if !ok || policy.State != "active" {
+		writeError(w, http.StatusForbidden, "no active policy")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{
+		"worker_id": workerID,
+		"policy":    policy,
+	}})
 }
 
 func (a *App) auditEventsHandler(w http.ResponseWriter, r *http.Request) {

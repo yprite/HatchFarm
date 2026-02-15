@@ -2,7 +2,8 @@
 
 `apps/agent` now includes a minimal daemon that:
 1. Registers a machine (`/api/v1/machines/register`)
-2. Sends periodic signed heartbeats (`/api/v1/workers/{id}/heartbeat`)
+2. Syncs effective worker policy (`/api/v1/workers/{id}/policy`)
+3. Sends periodic signed heartbeats (`/api/v1/workers/{id}/heartbeat`)
 
 ## Environment Variables
 
