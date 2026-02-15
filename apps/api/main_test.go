@@ -11,8 +11,8 @@ import (
 
 func newTestServer() (*App, http.Handler) {
 	app := newApp()
-	app.apiToken = "test-token"
-	h := app.corsMiddleware(app.loggingMiddleware(app.bodyLimitMiddleware(app.rateLimitMiddleware(app.routes()))))
+	app.apiToken = "test-" + randomID(8)
+	h := app.corsMiddleware(app.requestIDMiddleware(app.loggingMiddleware(app.tlsEnforcementMiddleware(app.bodyLimitMiddleware(app.rateLimitMiddleware(app.routes()))))))
 	return app, h
 }
 
@@ -33,8 +33,8 @@ func doJSON(t *testing.T, h http.Handler, method, path string, body interface{},
 	return w
 }
 
-func authHeader() map[string]string {
-	return map[string]string{"Authorization": "Bearer test-token", "X-Owner-ID": "own_1"}
+func authHeader(token string) map[string]string {
+	return map[string]string{"Authorization": "Bearer " + token, "X-Owner-ID": "own_1"}
 }
 
 func TestHealthHandler(t *testing.T) {
@@ -62,10 +62,10 @@ func TestProtectedEndpointRequiresAuth(t *testing.T) {
 }
 
 func TestConsentLifecycleAndHeartbeat(t *testing.T) {
-	_, h := newTestServer()
+	app, h := newTestServer()
 
 	// register machine
-	w := doJSON(t, h, http.MethodPost, "/api/v1/machines/register", map[string]string{"owner_id": "own_1", "name": "node-a"}, authHeader())
+	w := doJSON(t, h, http.MethodPost, "/api/v1/machines/register", map[string]string{"owner_id": "own_1", "name": "node-a"}, authHeader(app.apiToken))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("register expected 201, got %d: %s", w.Code, w.Body.String())
 	}
@@ -84,9 +84,9 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 	policyRules := map[string]interface{}{"max_cpu_percent": 60}
 	w = doJSON(t, h, http.MethodPost, "/api/v1/policies", map[string]interface{}{
 		"owner_id":  "own_1",
-		"signature": signPolicySignature("test-token", "own_1", policyRules),
+		"signature": signPolicySignature(app.apiToken, "own_1", policyRules),
 		"rules":     policyRules,
-	}, authHeader())
+	}, authHeader(app.apiToken))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("policy create expected 201, got %d: %s", w.Code, w.Body.String())
 	}
@@ -98,7 +98,7 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&pol)
 
 	// activate policy
-	w = doJSON(t, h, http.MethodPost, "/api/v1/policies/"+pol.Data.ID+"/activate", nil, authHeader())
+	w = doJSON(t, h, http.MethodPost, "/api/v1/policies/"+pol.Data.ID+"/activate", nil, authHeader(app.apiToken))
 	if w.Code != http.StatusOK {
 		t.Fatalf("activate expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -108,8 +108,8 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 		"owner_id":  "own_1",
 		"worker_id": reg.Data.Machine.ID,
 		"policy_id": pol.Data.ID,
-		"signature": signConsentSignature("test-token", "own_1", reg.Data.Machine.ID, pol.Data.ID),
-	}, authHeader())
+		"signature": signConsentSignature(app.apiToken, "own_1", reg.Data.Machine.ID, pol.Data.ID),
+	}, authHeader(app.apiToken))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("consent expected 201, got %d: %s", w.Code, w.Body.String())
 	}
@@ -137,7 +137,7 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 	}
 
 	// revoke consent
-	w = doJSON(t, h, http.MethodPost, "/api/v1/consents/"+con.Data.ID+"/revoke", nil, authHeader())
+	w = doJSON(t, h, http.MethodPost, "/api/v1/consents/"+con.Data.ID+"/revoke", nil, authHeader(app.apiToken))
 	if w.Code != http.StatusOK {
 		t.Fatalf("revoke expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -156,8 +156,8 @@ func TestConsentLifecycleAndHeartbeat(t *testing.T) {
 }
 
 func TestHeartbeatRejectsBadSignature(t *testing.T) {
-	_, h := newTestServer()
-	workerID, workerToken, policyID := setupWorkerConsent(t, h)
+	app, h := newTestServer()
+	workerID, workerToken, policyID := setupWorkerConsent(t, h, app.apiToken)
 
 	w := doJSON(t, h, http.MethodPost, "/api/v1/workers/"+workerID+"/heartbeat", map[string]interface{}{
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
@@ -171,8 +171,8 @@ func TestHeartbeatRejectsBadSignature(t *testing.T) {
 }
 
 func TestHeartbeatRejectsReplayNonce(t *testing.T) {
-	_, h := newTestServer()
-	workerID, workerToken, policyID := setupWorkerConsent(t, h)
+	app, h := newTestServer()
+	workerID, workerToken, policyID := setupWorkerConsent(t, h, app.apiToken)
 
 	ts := time.Now().UTC().Format(time.RFC3339)
 	nonce := "replay-nonce"
@@ -200,8 +200,8 @@ func TestHeartbeatRejectsReplayNonce(t *testing.T) {
 }
 
 func TestHeartbeatRejectsStaleTimestamp(t *testing.T) {
-	_, h := newTestServer()
-	workerID, workerToken, policyID := setupWorkerConsent(t, h)
+	app, h := newTestServer()
+	workerID, workerToken, policyID := setupWorkerConsent(t, h, app.apiToken)
 
 	stale := time.Now().UTC().Add(-(heartbeatMaxSkew + 10*time.Second)).Format(time.RFC3339)
 	sig := signHeartbeat(workerToken, workerID, stale, "stale-1", policyID)
@@ -231,9 +231,9 @@ func TestRateLimitKicksIn(t *testing.T) {
 	}
 }
 
-func setupWorkerConsent(t *testing.T, h http.Handler) (workerID, workerToken, policyID string) {
+func setupWorkerConsent(t *testing.T, h http.Handler, token string) (workerID, workerToken, policyID string) {
 	t.Helper()
-	w := doJSON(t, h, http.MethodPost, "/api/v1/machines/register", map[string]string{"owner_id": "own_1", "name": "node-a"}, authHeader())
+	w := doJSON(t, h, http.MethodPost, "/api/v1/machines/register", map[string]string{"owner_id": "own_1", "name": "node-a"}, authHeader(token))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("register expected 201, got %d", w.Code)
 	}
@@ -248,7 +248,7 @@ func setupWorkerConsent(t *testing.T, h http.Handler) (workerID, workerToken, po
 	_ = json.NewDecoder(w.Body).Decode(&reg)
 
 	rules := map[string]interface{}{"max_cpu_percent": 60}
-	w = doJSON(t, h, http.MethodPost, "/api/v1/policies", map[string]interface{}{"owner_id": "own_1", "signature": signPolicySignature("test-token", "own_1", rules), "rules": rules}, authHeader())
+	w = doJSON(t, h, http.MethodPost, "/api/v1/policies", map[string]interface{}{"owner_id": "own_1", "signature": signPolicySignature(token, "own_1", rules), "rules": rules}, authHeader(token))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("policy create expected 201, got %d", w.Code)
 	}
@@ -259,12 +259,12 @@ func setupWorkerConsent(t *testing.T, h http.Handler) (workerID, workerToken, po
 	}
 	_ = json.NewDecoder(w.Body).Decode(&pol)
 
-	w = doJSON(t, h, http.MethodPost, "/api/v1/policies/"+pol.Data.ID+"/activate", nil, authHeader())
+	w = doJSON(t, h, http.MethodPost, "/api/v1/policies/"+pol.Data.ID+"/activate", nil, authHeader(token))
 	if w.Code != http.StatusOK {
 		t.Fatalf("policy activate expected 200, got %d", w.Code)
 	}
 
-	w = doJSON(t, h, http.MethodPost, "/api/v1/consents", map[string]string{"owner_id": "own_1", "worker_id": reg.Data.Machine.ID, "policy_id": pol.Data.ID, "signature": signConsentSignature("test-token", "own_1", reg.Data.Machine.ID, pol.Data.ID)}, authHeader())
+	w = doJSON(t, h, http.MethodPost, "/api/v1/consents", map[string]string{"owner_id": "own_1", "worker_id": reg.Data.Machine.ID, "policy_id": pol.Data.ID, "signature": signConsentSignature(token, "own_1", reg.Data.Machine.ID, pol.Data.ID)}, authHeader(token))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("consent expected 201, got %d", w.Code)
 	}

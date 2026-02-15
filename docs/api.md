@@ -27,6 +27,7 @@ https://api.hatchfarm.ai/v1
   - Consent signature payload: `owner_id|worker_id|policy_id`
 - Heartbeat replay defense: timestamp skew window + nonce replay check
 - Basic API protection: rate limiting + request body size limits
+- Transport guard: optional HTTPS enforcement (`REQUIRE_HTTPS=true`), with explicit proxy-header trust toggle (`TRUST_PROXY_HEADERS=true`)
 
 ---
 

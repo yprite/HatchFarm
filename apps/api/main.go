@@ -23,10 +23,11 @@ import (
 )
 
 const (
-	version                  = "0.4.0"
+	version                  = "0.4.1"
 	maxBodyBytes             = 1 << 20 // 1MB
 	heartbeatMaxSkew         = 90 * time.Second
 	nonceReplayWindow        = 5 * time.Minute
+	nonceCleanupInterval     = 30 * time.Second
 	rateLimitRefillPerSecond = 5.0
 	rateLimitBurst           = 20.0
 	rateBucketTTL            = 10 * time.Minute
@@ -97,12 +98,13 @@ type tokenBucket struct {
 }
 
 type Store struct {
-	mu          sync.RWMutex
-	machines    map[string]*Machine
-	policies    map[string]*Policy
-	consents    map[string]*Consent
-	auditEvents []*AuditEvent
-	nonces      map[string]nonceRecord
+	mu               sync.RWMutex
+	machines         map[string]*Machine
+	policies         map[string]*Policy
+	consents         map[string]*Consent
+	auditEvents      []*AuditEvent
+	nonces           map[string]nonceRecord
+	lastNonceCleanup time.Time
 }
 
 type App struct {
@@ -174,10 +176,11 @@ func newApp() *App {
 
 	return &App{
 		store: &Store{
-			machines: map[string]*Machine{},
-			policies: map[string]*Policy{},
-			consents: map[string]*Consent{},
-			nonces:   map[string]nonceRecord{},
+			machines:         map[string]*Machine{},
+			policies:         map[string]*Policy{},
+			consents:         map[string]*Consent{},
+			nonces:           map[string]nonceRecord{},
+			lastNonceCleanup: time.Now().UTC(),
 		},
 		apiToken:       apiToken,
 		allowedOrigins: origins,
@@ -502,7 +505,7 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.cleanupNoncesLocked(now)
+	a.maybeCleanupNoncesLocked(now)
 	nonceKey := workerID + ":" + req.Nonce
 	if _, exists := a.store.nonces[nonceKey]; exists {
 		writeError(w, http.StatusUnauthorized, "invalid heartbeat auth")
@@ -671,12 +674,16 @@ func asFloat(v interface{}) (float64, bool) {
 	}
 }
 
-func (a *App) cleanupNoncesLocked(now time.Time) {
+func (a *App) maybeCleanupNoncesLocked(now time.Time) {
+	if now.Sub(a.store.lastNonceCleanup) < nonceCleanupInterval {
+		return
+	}
 	for k, rec := range a.store.nonces {
 		if now.Sub(rec.SeenAt) > nonceReplayWindow {
 			delete(a.store.nonces, k)
 		}
 	}
+	a.store.lastNonceCleanup = now
 }
 
 func decodeJSON(r *http.Request, v interface{}) error {
