@@ -665,8 +665,15 @@ func (a *App) auditEventsHandler(w http.ResponseWriter, r *http.Request) {
 	defer a.store.mu.RUnlock()
 	filtered := make([]*AuditEvent, 0, len(a.store.auditEvents))
 	for _, ev := range a.store.auditEvents {
-		if ev.Actor == "owner:"+ownerID || ev.Actor == "worker:"+ownerID {
+		if ev.Actor == "owner:"+ownerID {
 			filtered = append(filtered, ev)
+			continue
+		}
+		if strings.HasPrefix(ev.Actor, "worker:") {
+			workerID := strings.TrimPrefix(ev.Actor, "worker:")
+			if m, ok := a.store.machines[workerID]; ok && m.OwnerID == ownerID {
+				filtered = append(filtered, ev)
+			}
 		}
 	}
 	total := len(filtered)

@@ -262,6 +262,47 @@ func TestPolicyValidationRejectsInvalidAllowedHours(t *testing.T) {
 	}
 }
 
+func TestAuditEventsIncludeOwnedWorkerEvents(t *testing.T) {
+	app, h := newTestServer()
+	workerID, workerToken, policyID := setupWorkerConsent(t, h, app.apiToken)
+
+	ts := time.Now().UTC().Format(time.RFC3339)
+	nonce := "audit-1"
+	sig := signHeartbeat(workerToken, workerID, ts, nonce, policyID)
+	w := doJSON(t, h, http.MethodPost, "/api/v1/workers/"+workerID+"/heartbeat", map[string]interface{}{
+		"timestamp": ts,
+		"nonce":     nonce,
+		"policy_id": policyID,
+		"signature": sig,
+	}, map[string]string{"X-Machine-Token": workerToken})
+	if w.Code != http.StatusOK {
+		t.Fatalf("heartbeat expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	w = doJSON(t, h, http.MethodGet, "/api/v1/audit/events?limit=200", nil, authHeader(app.apiToken))
+	if w.Code != http.StatusOK {
+		t.Fatalf("audit list expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Events []AuditEvent `json:"events"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+
+	found := false
+	for _, ev := range resp.Data.Events {
+		if ev.Type == "worker_heartbeat" && ev.Actor == "worker:"+workerID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected owned worker heartbeat event to be visible in owner audit list")
+	}
+}
+
 func setupWorkerConsent(t *testing.T, h http.Handler, token string) (workerID, workerToken, policyID string) {
 	t.Helper()
 	w := doJSON(t, h, http.MethodPost, "/api/v1/machines/register", map[string]string{"owner_id": "own_1", "name": "node-a"}, authHeader(token))

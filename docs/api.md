@@ -51,7 +51,7 @@ https://api.hatchfarm.ai/v1
 | POST | /consents | Create consent binding owner+worker+policy (owner-auth required) |
 | POST | /consents/{id}/revoke | Revoke consent (owner-auth required) |
 | POST | /workers/{id}/heartbeat | Worker heartbeat with machine token + signature |
-| GET | /audit/events | List audit events (owner-auth required, supports `limit`/`offset`) |
+| GET | /audit/events | List audit events (owner-auth required, supports `limit`/`offset`, includes owned worker events) |
 
 > Note: Current code uses `/api/v1/*` prefix. Tables above omit prefix for readability.
 
