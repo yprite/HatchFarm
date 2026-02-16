@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -888,6 +889,28 @@ func (a *App) ownerWorkerStatusesHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	limit := defaultAuditPageSize
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 1 {
+			writeError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		if v > maxAuditPageSize {
+			v = maxAuditPageSize
+		}
+		limit = v
+	}
+	offset := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("offset")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "invalid offset")
+			return
+		}
+		offset = v
+	}
+
 	now := time.Now().UTC()
 	a.store.mu.RLock()
 	items := make([]map[string]interface{}, 0)
@@ -917,9 +940,27 @@ func (a *App) ownerWorkerStatusesHandler(w http.ResponseWriter, r *http.Request)
 	}
 	a.store.mu.RUnlock()
 
+	sort.Slice(items, func(i, j int) bool {
+		wi, _ := items[i]["worker_id"].(string)
+		wj, _ := items[j]["worker_id"].(string)
+		return wi < wj
+	})
+
+	total := len(items)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	paged := items[offset:end]
+
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{
-		"workers":         items,
-		"total":           len(items),
+		"workers":         paged,
+		"total":           total,
+		"limit":           limit,
+		"offset":          offset,
 		"stale_threshold": int(a.workerStatusStaleAfter.Seconds()),
 	}})
 }

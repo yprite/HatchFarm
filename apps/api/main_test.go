@@ -401,7 +401,7 @@ func TestOwnerWorkerStatusesEndpoint(t *testing.T) {
 		t.Fatalf("heartbeat expected 200, got %d", w.Code)
 	}
 
-	w = doJSON(t, h, http.MethodGet, "/api/v1/workers/statuses", nil, authHeader(app.apiToken))
+	w = doJSON(t, h, http.MethodGet, "/api/v1/workers/statuses?limit=1&offset=0", nil, authHeader(app.apiToken))
 	if w.Code != http.StatusOK {
 		t.Fatalf("statuses expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -409,6 +409,8 @@ func TestOwnerWorkerStatusesEndpoint(t *testing.T) {
 		Success bool `json:"success"`
 		Data    struct {
 			Total   int `json:"total"`
+			Limit   int `json:"limit"`
+			Offset  int `json:"offset"`
 			Workers []struct {
 				WorkerID string `json:"worker_id"`
 				PolicyID string `json:"policy_id"`
@@ -417,9 +419,14 @@ func TestOwnerWorkerStatusesEndpoint(t *testing.T) {
 		} `json:"data"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&resp)
-	if !resp.Success || resp.Data.Total < 1 {
+	if !resp.Success || resp.Data.Total < 1 || resp.Data.Limit != 1 || resp.Data.Offset != 0 {
 		t.Fatalf("unexpected statuses response")
 	}
+	w = doJSON(t, h, http.MethodGet, "/api/v1/workers/statuses", nil, authHeader(app.apiToken))
+	if w.Code != http.StatusOK {
+		t.Fatalf("statuses expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	_ = json.NewDecoder(w.Body).Decode(&resp)
 	found := false
 	for _, it := range resp.Data.Workers {
 		if it.WorkerID == workerID {
@@ -431,6 +438,18 @@ func TestOwnerWorkerStatusesEndpoint(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("target worker not present in statuses")
+	}
+}
+
+func TestOwnerWorkerStatusesInvalidPagination(t *testing.T) {
+	app, h := newTestServer()
+	w := doJSON(t, h, http.MethodGet, "/api/v1/workers/statuses?limit=0", nil, authHeader(app.apiToken))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid limit, got %d", w.Code)
+	}
+	w = doJSON(t, h, http.MethodGet, "/api/v1/workers/statuses?offset=-1", nil, authHeader(app.apiToken))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid offset, got %d", w.Code)
 	}
 }
 
