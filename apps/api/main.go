@@ -286,6 +286,7 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("/api/v1/policies/", a.authRequired(a.activatePolicyHandler))
 	mux.HandleFunc("/api/v1/consents", a.authRequired(a.createConsentHandler))
 	mux.HandleFunc("/api/v1/consents/", a.authRequired(a.revokeConsentHandler))
+	mux.HandleFunc("/api/v1/workers/summary", a.ownerWorkerSummaryHandler)
 	mux.HandleFunc("/api/v1/workers/statuses", a.ownerWorkerStatusesHandler)
 	mux.HandleFunc("/api/v1/workers/", a.workerHandler)
 	mux.HandleFunc("/api/v1/audit/events", a.authRequired(a.auditEventsHandler))
@@ -877,6 +878,56 @@ func (a *App) workerStatusHandler(w http.ResponseWriter, r *http.Request) {
 		"updated_at":      status.UpdatedAt,
 		"stale":           stale,
 		"age_seconds":     int(age.Seconds()),
+		"stale_threshold": int(a.workerStatusStaleAfter.Seconds()),
+	}})
+}
+
+func (a *App) ownerWorkerSummaryHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	ownerID := ownerIDFromHeader(r)
+	auth := r.Header.Get("Authorization")
+	if ownerID == "" || !strings.HasPrefix(auth, "Bearer ") || !hmac.Equal([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(a.apiToken)) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	now := time.Now().UTC()
+	total := 0
+	stale := 0
+	fresh := 0
+	unknown := 0
+
+	a.store.mu.RLock()
+	for workerID, m := range a.store.machines {
+		if m.OwnerID != ownerID {
+			continue
+		}
+		total++
+		st, ok := a.store.workerStatus[workerID]
+		if !ok {
+			unknown++
+			continue
+		}
+		age := now.Sub(st.LastHeartbeat)
+		if age < 0 {
+			age = 0
+		}
+		if age > a.workerStatusStaleAfter {
+			stale++
+		} else {
+			fresh++
+		}
+	}
+	a.store.mu.RUnlock()
+
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{
+		"total":           total,
+		"fresh":           fresh,
+		"stale":           stale,
+		"unknown":         unknown,
 		"stale_threshold": int(a.workerStatusStaleAfter.Seconds()),
 	}})
 }

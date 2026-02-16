@@ -384,6 +384,43 @@ func TestWorkerStatusEndpoint(t *testing.T) {
 	}
 }
 
+func TestOwnerWorkerSummaryEndpoint(t *testing.T) {
+	app, h := newTestServer()
+	app.workerStatusStaleAfter = 1 * time.Second
+	workerID, workerToken, workerCertID, policyID := setupWorkerConsent(t, h, app.apiToken)
+
+	ts := time.Now().UTC().Format(time.RFC3339)
+	nonce := "summary-1"
+	sig := signHeartbeat(workerToken, workerID, ts, nonce, policyID)
+	w := doJSON(t, h, http.MethodPost, "/api/v1/workers/"+workerID+"/heartbeat", map[string]interface{}{
+		"timestamp": ts,
+		"nonce":     nonce,
+		"policy_id": policyID,
+		"signature": sig,
+	}, map[string]string{"X-Machine-Token": workerToken, "X-Machine-Certificate-Id": workerCertID})
+	if w.Code != http.StatusOK {
+		t.Fatalf("heartbeat expected 200, got %d", w.Code)
+	}
+
+	w = doJSON(t, h, http.MethodGet, "/api/v1/workers/summary", nil, authHeader(app.apiToken))
+	if w.Code != http.StatusOK {
+		t.Fatalf("summary expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Total   int `json:"total"`
+			Fresh   int `json:"fresh"`
+			Stale   int `json:"stale"`
+			Unknown int `json:"unknown"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	if !resp.Success || resp.Data.Total < 1 || resp.Data.Fresh < 1 {
+		t.Fatalf("unexpected worker summary payload")
+	}
+}
+
 func TestOwnerWorkerStatusesEndpoint(t *testing.T) {
 	app, h := newTestServer()
 	workerID, workerToken, workerCertID, policyID := setupWorkerConsent(t, h, app.apiToken)
