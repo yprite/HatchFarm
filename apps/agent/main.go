@@ -145,13 +145,14 @@ func main() {
 		}
 	}
 	if resolvedPolicyID != cfg.PolicyID {
-		log.Fatalf("worker policy mismatch: expected=%s got=%s", cfg.PolicyID, resolvedPolicyID)
+		log.Printf("warning: configured policy_id=%s differs from active consent policy_id=%s; using active policy for heartbeat", cfg.PolicyID, resolvedPolicyID)
 	}
+	currentPolicyID := resolvedPolicyID
 	if err := saveState(cfg.StateFile, AgentState{
 		MachineID:     machineID,
 		MachineToken:  machineToken,
 		MachineCertID: machineCertID,
-		PolicyID:      resolvedPolicyID,
+		PolicyID:      currentPolicyID,
 		UpdatedAt:     time.Now().UTC(),
 	}); err != nil {
 		log.Printf("warning: failed to persist agent state: %v", err)
@@ -173,15 +174,27 @@ func main() {
 			return
 		case <-timer.C:
 			nextDelay := heartbeatInterval
-			err := sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID)
+			err := sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID, currentPolicyID)
 			if apiErr, ok := err.(*apiCallError); ok && apiErr.Status == http.StatusUnauthorized {
 				newCertID, certErr := rotateMachineCertificate(ctx, client, cfg, machineID)
 				if certErr == nil {
 					machineCertID = newCertID
-					err = sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID)
+					err = sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID, currentPolicyID)
 					if err == nil {
-						if saveErr := saveState(cfg.StateFile, AgentState{MachineID: machineID, MachineToken: machineToken, MachineCertID: machineCertID, PolicyID: cfg.PolicyID, UpdatedAt: time.Now().UTC()}); saveErr != nil {
+						if saveErr := saveState(cfg.StateFile, AgentState{MachineID: machineID, MachineToken: machineToken, MachineCertID: machineCertID, PolicyID: currentPolicyID, UpdatedAt: time.Now().UTC()}); saveErr != nil {
 							log.Printf("warning: failed to persist rotated cert state: %v", saveErr)
+						}
+					}
+				}
+			}
+			if apiErr, ok := err.(*apiCallError); ok && apiErr.Status == http.StatusForbidden {
+				latestPolicyID, policyErr := fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
+				if policyErr == nil && latestPolicyID != "" && latestPolicyID != currentPolicyID {
+					currentPolicyID = latestPolicyID
+					err = sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID, currentPolicyID)
+					if err == nil {
+						if saveErr := saveState(cfg.StateFile, AgentState{MachineID: machineID, MachineToken: machineToken, MachineCertID: machineCertID, PolicyID: currentPolicyID, UpdatedAt: time.Now().UTC()}); saveErr != nil {
+							log.Printf("warning: failed to persist updated policy state: %v", saveErr)
 						}
 					}
 				}
@@ -344,15 +357,15 @@ func fetchWorkerPolicy(ctx context.Context, client *http.Client, cfg AgentConfig
 	return out.Data.Policy.ID, nil
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken, machineCertID string) error {
+func sendHeartbeat(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken, machineCertID, policyID string) error {
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 	nonce := randomID(12)
-	sig := signHeartbeat(machineToken, machineID, timestamp, nonce, cfg.PolicyID)
+	sig := signHeartbeat(machineToken, machineID, timestamp, nonce, policyID)
 
 	payload := map[string]interface{}{
 		"timestamp": timestamp,
 		"nonce":     nonce,
-		"policy_id": cfg.PolicyID,
+		"policy_id": policyID,
 		"metrics": map[string]interface{}{
 			"cpu": 10,
 		},

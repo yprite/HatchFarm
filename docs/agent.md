@@ -32,5 +32,6 @@ go run .
   - machine register retry with exponential backoff
   - heartbeat retry backoff with capped consecutive failure exit
   - on worker auth failure (401), cert rotation is attempted and heartbeat is retried once
+  - on consent/policy mismatch (403), worker policy is re-fetched and heartbeat retried with latest active policy
   - local state persistence/reuse across restarts (`AGENT_STATE_FILE`)
 - This is an evolving Sprint 2 runtime loop; attestation and update orchestration are planned next.
