@@ -23,6 +23,7 @@ https://api.hatchfarm.ai/v1
   - If token is missing, server generates an ephemeral token at boot and logs a warning (dev fallback only).
 - Worker heartbeat: `X-Machine-Token` + `X-Machine-Certificate-Id` + HMAC signature payload
 - Failed worker auth attempts are recorded to audit stream as `worker_auth_failed`
+- Denied machine certificate issuance attempts are recorded as `machine_certificate_issue_denied`
 - Policy/consent write requests: HMAC signatures validated server-side (dev baseline)
   - Policy signature payload: `owner_id|json(rules)`
   - Consent signature payload: `owner_id|worker_id|policy_id`

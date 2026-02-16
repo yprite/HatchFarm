@@ -396,6 +396,7 @@ func (a *App) issueMachineCertificateHandler(w http.ResponseWriter, r *http.Requ
 
 	machineToken := strings.TrimSpace(r.Header.Get("X-Machine-Token"))
 	if machineToken == "" {
+		a.auditOwnerAction(ownerID, machineID, "machine_certificate_issue_denied", "missing_machine_token")
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -404,14 +405,17 @@ func (a *App) issueMachineCertificateHandler(w http.ResponseWriter, r *http.Requ
 	defer a.store.mu.Unlock()
 	m, ok := a.store.machines[machineID]
 	if !ok {
+		a.appendAuditLocked("machine_certificate_issue_denied", "owner:"+ownerID, machineID, map[string]interface{}{"reason": "machine_not_found"})
 		writeError(w, http.StatusNotFound, "machine not found")
 		return
 	}
 	if m.OwnerID != ownerID {
+		a.appendAuditLocked("machine_certificate_issue_denied", "owner:"+ownerID, machineID, map[string]interface{}{"reason": "owner_mismatch"})
 		writeError(w, http.StatusForbidden, "forbidden")
 		return
 	}
 	if !hmac.Equal([]byte(m.Secret), []byte(machineToken)) {
+		a.appendAuditLocked("machine_certificate_issue_denied", "owner:"+ownerID, machineID, map[string]interface{}{"reason": "invalid_machine_token"})
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -1111,6 +1115,12 @@ func (a *App) auditWorkerAuthFailure(workerID, reason string) {
 	a.store.mu.Lock()
 	defer a.store.mu.Unlock()
 	a.appendAuditLocked("worker_auth_failed", "worker:"+workerID, workerID, map[string]interface{}{"reason": reason})
+}
+
+func (a *App) auditOwnerAction(ownerID, objectID, eventType, reason string) {
+	a.store.mu.Lock()
+	defer a.store.mu.Unlock()
+	a.appendAuditLocked(eventType, "owner:"+ownerID, objectID, map[string]interface{}{"reason": reason})
 }
 
 func (a *App) saveWorkerStatusState() error {

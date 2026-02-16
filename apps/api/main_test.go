@@ -499,6 +499,31 @@ func TestIssueMachineCertificateEndpoint(t *testing.T) {
 		t.Fatalf("certificate issue without machine token expected 401, got %d", w.Code)
 	}
 
+	aw := doJSON(t, h, http.MethodGet, "/api/v1/audit/events", nil, authHeader(app.apiToken))
+	if aw.Code != http.StatusOK {
+		t.Fatalf("audit expected 200, got %d", aw.Code)
+	}
+	var auditResp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Events []struct {
+				Type     string `json:"type"`
+				ObjectID string `json:"object_id"`
+			} `json:"events"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(aw.Body).Decode(&auditResp)
+	deniedSeen := false
+	for _, ev := range auditResp.Data.Events {
+		if ev.Type == "machine_certificate_issue_denied" && ev.ObjectID == reg.Data.Machine.ID {
+			deniedSeen = true
+			break
+		}
+	}
+	if !deniedSeen {
+		t.Fatalf("expected machine_certificate_issue_denied audit event")
+	}
+
 	headers := authHeader(app.apiToken)
 	headers["X-Machine-Token"] = reg.Data.MachineToken
 	w = doJSON(t, h, http.MethodPost, "/api/v1/machines/"+reg.Data.Machine.ID+"/certificate", nil, headers)
