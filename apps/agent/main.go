@@ -37,11 +37,12 @@ type AgentConfig struct {
 }
 
 type AgentState struct {
-	MachineID     string    `json:"machine_id"`
-	MachineToken  string    `json:"machine_token"`
-	MachineCertID string    `json:"machine_certificate_id"`
-	PolicyID      string    `json:"policy_id"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	MachineID      string    `json:"machine_id"`
+	MachineToken   string    `json:"machine_token"`
+	MachineCertID  string    `json:"machine_certificate_id"`
+	PolicyID       string    `json:"policy_id"`
+	PolicySyncedAt time.Time `json:"policy_synced_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type RegisterResponse struct {
@@ -66,12 +67,18 @@ type APIResponse struct {
 type WorkerPolicyResponse struct {
 	Success bool `json:"success"`
 	Data    struct {
-		WorkerID string `json:"worker_id"`
-		Policy   struct {
+		WorkerID           string    `json:"worker_id"`
+		ConsentEffectiveAt time.Time `json:"consent_effective_at"`
+		Policy             struct {
 			ID string `json:"id"`
 		} `json:"policy"`
 	} `json:"data"`
 	Error string `json:"error"`
+}
+
+type WorkerPolicySnapshot struct {
+	PolicyID    string
+	EffectiveAt time.Time
 }
 
 type CertificateIssueResponse struct {
@@ -122,14 +129,14 @@ func main() {
 		log.Printf("registered machine_id=%s", machineID)
 	}
 
-	resolvedPolicyID, err := fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
+	policySnapshot, err := fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
 	if err != nil {
 		if apiErr, ok := err.(*apiCallError); ok && apiErr.Status == http.StatusUnauthorized {
 			log.Printf("policy sync unauthorized, rotating certificate")
-			newCertID, certErr := rotateMachineCertificate(ctx, client, cfg, machineID)
+			newCertID, certErr := rotateMachineCertificate(ctx, client, cfg, machineID, machineToken)
 			if certErr == nil {
 				machineCertID = newCertID
-				resolvedPolicyID, err = fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
+				policySnapshot, err = fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
 			}
 		}
 	}
@@ -139,21 +146,29 @@ func main() {
 		if err != nil {
 			log.Fatalf("re-register machine failed: %v", err)
 		}
-		resolvedPolicyID, err = fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
+		policySnapshot, err = fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
 		if err != nil {
 			log.Fatalf("worker policy sync failed after re-register: %v", err)
 		}
 	}
-	if resolvedPolicyID != cfg.PolicyID {
-		log.Printf("warning: configured policy_id=%s differs from active consent policy_id=%s; using active policy for heartbeat", cfg.PolicyID, resolvedPolicyID)
+	if policySnapshot.PolicyID != cfg.PolicyID {
+		log.Printf("warning: configured policy_id=%s differs from active consent policy_id=%s; using active policy for heartbeat", cfg.PolicyID, policySnapshot.PolicyID)
 	}
-	currentPolicyID := resolvedPolicyID
+	currentPolicyID := policySnapshot.PolicyID
+	currentPolicySyncedAt := policySnapshot.EffectiveAt
+	if currentPolicySyncedAt.IsZero() {
+		currentPolicySyncedAt = time.Now().UTC()
+	}
+	if loaded && state.PolicySyncedAt.After(currentPolicySyncedAt) {
+		currentPolicySyncedAt = state.PolicySyncedAt
+	}
 	if err := saveState(cfg.StateFile, AgentState{
-		MachineID:     machineID,
-		MachineToken:  machineToken,
-		MachineCertID: machineCertID,
-		PolicyID:      currentPolicyID,
-		UpdatedAt:     time.Now().UTC(),
+		MachineID:      machineID,
+		MachineToken:   machineToken,
+		MachineCertID:  machineCertID,
+		PolicyID:       currentPolicyID,
+		PolicySyncedAt: currentPolicySyncedAt,
+		UpdatedAt:      time.Now().UTC(),
 	}); err != nil {
 		log.Printf("warning: failed to persist agent state: %v", err)
 	}
@@ -176,24 +191,25 @@ func main() {
 			nextDelay := heartbeatInterval
 			err := sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID, currentPolicyID)
 			if apiErr, ok := err.(*apiCallError); ok && apiErr.Status == http.StatusUnauthorized {
-				newCertID, certErr := rotateMachineCertificate(ctx, client, cfg, machineID)
+				newCertID, certErr := rotateMachineCertificate(ctx, client, cfg, machineID, machineToken)
 				if certErr == nil {
 					machineCertID = newCertID
 					err = sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID, currentPolicyID)
 					if err == nil {
-						if saveErr := saveState(cfg.StateFile, AgentState{MachineID: machineID, MachineToken: machineToken, MachineCertID: machineCertID, PolicyID: currentPolicyID, UpdatedAt: time.Now().UTC()}); saveErr != nil {
+						if saveErr := saveState(cfg.StateFile, AgentState{MachineID: machineID, MachineToken: machineToken, MachineCertID: machineCertID, PolicyID: currentPolicyID, PolicySyncedAt: currentPolicySyncedAt, UpdatedAt: time.Now().UTC()}); saveErr != nil {
 							log.Printf("warning: failed to persist rotated cert state: %v", saveErr)
 						}
 					}
 				}
 			}
 			if apiErr, ok := err.(*apiCallError); ok && apiErr.Status == http.StatusForbidden {
-				latestPolicyID, policyErr := fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
-				if policyErr == nil && latestPolicyID != "" && latestPolicyID != currentPolicyID {
-					currentPolicyID = latestPolicyID
+				latestPolicy, policyErr := fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
+				if policyErr == nil && latestPolicy.PolicyID != "" && latestPolicy.EffectiveAt.After(currentPolicySyncedAt) {
+					currentPolicyID = latestPolicy.PolicyID
+					currentPolicySyncedAt = latestPolicy.EffectiveAt
 					err = sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID, currentPolicyID)
 					if err == nil {
-						if saveErr := saveState(cfg.StateFile, AgentState{MachineID: machineID, MachineToken: machineToken, MachineCertID: machineCertID, PolicyID: currentPolicyID, UpdatedAt: time.Now().UTC()}); saveErr != nil {
+						if saveErr := saveState(cfg.StateFile, AgentState{MachineID: machineID, MachineToken: machineToken, MachineCertID: machineCertID, PolicyID: currentPolicyID, PolicySyncedAt: currentPolicySyncedAt, UpdatedAt: time.Now().UTC()}); saveErr != nil {
 							log.Printf("warning: failed to persist updated policy state: %v", saveErr)
 						}
 					}
@@ -303,13 +319,14 @@ func registerMachine(ctx context.Context, client *http.Client, cfg AgentConfig) 
 	return out.Data.Machine.ID, out.Data.MachineToken, out.Data.MachineCert.CertificateID, nil
 }
 
-func rotateMachineCertificate(ctx context.Context, client *http.Client, cfg AgentConfig, machineID string) (string, error) {
+func rotateMachineCertificate(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.APIBaseURL+"/api/v1/machines/"+machineID+"/certificate", nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.OwnerToken)
 	req.Header.Set("X-Owner-ID", cfg.OwnerID)
+	req.Header.Set("X-Machine-Token", machineToken)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -330,31 +347,31 @@ func rotateMachineCertificate(ctx context.Context, client *http.Client, cfg Agen
 	return out.Data.CertificateID, nil
 }
 
-func fetchWorkerPolicy(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken, machineCertID string) (string, error) {
+func fetchWorkerPolicy(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken, machineCertID string) (WorkerPolicySnapshot, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.APIBaseURL+"/api/v1/workers/"+machineID+"/policy", nil)
 	if err != nil {
-		return "", err
+		return WorkerPolicySnapshot{}, err
 	}
 	req.Header.Set("X-Machine-Token", machineToken)
 	req.Header.Set("X-Machine-Certificate-Id", machineCertID)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return WorkerPolicySnapshot{}, err
 	}
 	defer resp.Body.Close()
 
 	var out WorkerPolicyResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
+		return WorkerPolicySnapshot{}, err
 	}
 	if resp.StatusCode >= 300 || !out.Success {
-		return "", &apiCallError{Status: resp.StatusCode, Message: out.Error}
+		return WorkerPolicySnapshot{}, &apiCallError{Status: resp.StatusCode, Message: out.Error}
 	}
 	if out.Data.Policy.ID == "" {
-		return "", fmt.Errorf("worker policy fetch returned empty policy id")
+		return WorkerPolicySnapshot{}, fmt.Errorf("worker policy fetch returned empty policy id")
 	}
-	return out.Data.Policy.ID, nil
+	return WorkerPolicySnapshot{PolicyID: out.Data.Policy.ID, EffectiveAt: out.Data.ConsentEffectiveAt}, nil
 }
 
 func sendHeartbeat(ctx context.Context, client *http.Client, cfg AgentConfig, machineID, machineToken, machineCertID, policyID string) error {

@@ -394,11 +394,19 @@ func TestIssueMachineCertificateEndpoint(t *testing.T) {
 			Machine struct {
 				ID string `json:"id"`
 			} `json:"machine"`
+			MachineToken string `json:"machine_token"`
 		} `json:"data"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&reg)
 
 	w = doJSON(t, h, http.MethodPost, "/api/v1/machines/"+reg.Data.Machine.ID+"/certificate", nil, authHeader(app.apiToken))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("certificate issue without machine token expected 401, got %d", w.Code)
+	}
+
+	headers := authHeader(app.apiToken)
+	headers["X-Machine-Token"] = reg.Data.MachineToken
+	w = doJSON(t, h, http.MethodPost, "/api/v1/machines/"+reg.Data.Machine.ID+"/certificate", nil, headers)
 	if w.Code != http.StatusOK {
 		t.Fatalf("certificate issue expected 200, got %d: %s", w.Code, w.Body.String())
 	}

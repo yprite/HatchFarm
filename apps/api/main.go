@@ -390,6 +390,12 @@ func (a *App) issueMachineCertificateHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	machineToken := strings.TrimSpace(r.Header.Get("X-Machine-Token"))
+	if machineToken == "" {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
 	a.store.mu.Lock()
 	defer a.store.mu.Unlock()
 	m, ok := a.store.machines[machineID]
@@ -399,6 +405,10 @@ func (a *App) issueMachineCertificateHandler(w http.ResponseWriter, r *http.Requ
 	}
 	if m.OwnerID != ownerID {
 		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	if !hmac.Equal([]byte(m.Secret), []byte(machineToken)) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	cert, err := a.issueMachineCertificateLocked(machineID)
@@ -908,8 +918,9 @@ func (a *App) workerPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{
-		"worker_id": workerID,
-		"policy":    policy,
+		"worker_id":            workerID,
+		"policy":               policy,
+		"consent_effective_at": latestConsent.EffectiveAt,
 	}})
 }
 
