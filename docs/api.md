@@ -44,6 +44,7 @@ https://api.hatchfarm.ai/v1
   - `REDIS_RATE_LIMIT_FALLBACK` (default `true`): if Redis limiter fails, fallback to local limiter
 - Worker status persistence:
   - `WORKER_STATUS_STATE_FILE` (default `.worker_status_state.json`) persists worker heartbeat status across API restarts
+  - `WORKER_STATUS_STALE_SECONDS` (default `60`) controls stale-status threshold in `/workers/{id}/status`
 
 ---
 
@@ -56,7 +57,7 @@ https://api.hatchfarm.ai/v1
 | POST | /machines/register | Register provider machine (owner-auth required, returns token + short-lived machine certificate) |
 | POST | /machines/{id}/certificate | Issue/rotate short-lived machine certificate (owner-auth + `X-Machine-Token` required) |
 | GET | /workers/{id}/policy | Worker policy fetch (requires machine token + certificate id) |
-| GET | /workers/{id}/status | Owner-auth worker runtime status (last heartbeat / policy) |
+| GET | /workers/{id}/status | Owner-auth worker runtime status (last heartbeat / policy / stale flag) |
 | GET | /metrics | Basic Prometheus-style runtime metrics (auth required unless `METRICS_PUBLIC=true`) |
 | POST | /policies | Create signed policy draft (owner-auth required) |
 | POST | /policies/{id}/activate | Activate policy (owner-auth required) |

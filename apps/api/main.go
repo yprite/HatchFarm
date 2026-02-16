@@ -143,6 +143,7 @@ type App struct {
 	redisRateLimitMax      int
 	metricsPublic          bool
 	workerStatusStateFile  string
+	workerStatusStaleAfter time.Duration
 }
 
 func main() {
@@ -227,6 +228,7 @@ func newApp() *App {
 		redisRateLimitMax:      envIntOrDefault("REDIS_RATE_LIMIT_MAX_REQUESTS", int(rateLimitBurst)),
 		metricsPublic:          strings.EqualFold(envOrDefault("METRICS_PUBLIC", "false"), "true"),
 		workerStatusStateFile:  envOrDefault("WORKER_STATUS_STATE_FILE", ".worker_status_state.json"),
+		workerStatusStaleAfter: time.Duration(envIntOrDefault("WORKER_STATUS_STALE_SECONDS", 60)) * time.Second,
 	}
 	app.redisClient = initRedisClient()
 	if err := app.loadWorkerStatusState(); err != nil {
@@ -857,7 +859,20 @@ func (a *App) workerStatusHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "worker status not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: status})
+	age := time.Since(status.LastHeartbeat)
+	if age < 0 {
+		age = 0
+	}
+	stale := age > a.workerStatusStaleAfter
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{
+		"worker_id":       status.WorkerID,
+		"last_heartbeat":  status.LastHeartbeat,
+		"policy_id":       status.PolicyID,
+		"updated_at":      status.UpdatedAt,
+		"stale":           stale,
+		"age_seconds":     int(age.Seconds()),
+		"stale_threshold": int(a.workerStatusStaleAfter.Seconds()),
+	}})
 }
 
 func (a *App) workerPolicyHandler(w http.ResponseWriter, r *http.Request) {

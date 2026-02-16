@@ -375,11 +375,37 @@ func TestWorkerStatusEndpoint(t *testing.T) {
 		Data    struct {
 			WorkerID string `json:"worker_id"`
 			PolicyID string `json:"policy_id"`
+			Stale    bool   `json:"stale"`
 		} `json:"data"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&resp)
-	if resp.Data.WorkerID != workerID || resp.Data.PolicyID != policyID {
+	if resp.Data.WorkerID != workerID || resp.Data.PolicyID != policyID || resp.Data.Stale {
 		t.Fatalf("unexpected worker status payload")
+	}
+}
+
+func TestWorkerStatusStaleFlag(t *testing.T) {
+	app, h := newTestServer()
+	app.workerStatusStaleAfter = 1 * time.Second
+	workerID, _, _, policyID := setupWorkerConsent(t, h, app.apiToken)
+
+	past := time.Now().UTC().Add(-2 * time.Second)
+	app.store.mu.Lock()
+	app.store.workerStatus[workerID] = &WorkerStatus{WorkerID: workerID, LastHeartbeat: past, PolicyID: policyID, UpdatedAt: past}
+	app.store.mu.Unlock()
+
+	w := doJSON(t, h, http.MethodGet, "/api/v1/workers/"+workerID+"/status", nil, authHeader(app.apiToken))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			Stale bool `json:"stale"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	if !resp.Data.Stale {
+		t.Fatalf("expected stale=true")
 	}
 }
 
