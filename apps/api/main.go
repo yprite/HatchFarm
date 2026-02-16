@@ -285,6 +285,7 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("/api/v1/policies/", a.authRequired(a.activatePolicyHandler))
 	mux.HandleFunc("/api/v1/consents", a.authRequired(a.createConsentHandler))
 	mux.HandleFunc("/api/v1/consents/", a.authRequired(a.revokeConsentHandler))
+	mux.HandleFunc("/api/v1/workers/statuses", a.ownerWorkerStatusesHandler)
 	mux.HandleFunc("/api/v1/workers/", a.workerHandler)
 	mux.HandleFunc("/api/v1/audit/events", a.authRequired(a.auditEventsHandler))
 	return mux
@@ -871,6 +872,54 @@ func (a *App) workerStatusHandler(w http.ResponseWriter, r *http.Request) {
 		"updated_at":      status.UpdatedAt,
 		"stale":           stale,
 		"age_seconds":     int(age.Seconds()),
+		"stale_threshold": int(a.workerStatusStaleAfter.Seconds()),
+	}})
+}
+
+func (a *App) ownerWorkerStatusesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	ownerID := ownerIDFromHeader(r)
+	auth := r.Header.Get("Authorization")
+	if ownerID == "" || !strings.HasPrefix(auth, "Bearer ") || !hmac.Equal([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(a.apiToken)) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	now := time.Now().UTC()
+	a.store.mu.RLock()
+	items := make([]map[string]interface{}, 0)
+	for workerID, m := range a.store.machines {
+		if m.OwnerID != ownerID {
+			continue
+		}
+		entry := map[string]interface{}{
+			"worker_id": workerID,
+			"name":      m.Name,
+		}
+		if st, ok := a.store.workerStatus[workerID]; ok {
+			age := now.Sub(st.LastHeartbeat)
+			if age < 0 {
+				age = 0
+			}
+			entry["last_heartbeat"] = st.LastHeartbeat
+			entry["policy_id"] = st.PolicyID
+			entry["updated_at"] = st.UpdatedAt
+			entry["stale"] = age > a.workerStatusStaleAfter
+			entry["age_seconds"] = int(age.Seconds())
+		} else {
+			entry["stale"] = true
+			entry["age_seconds"] = -1
+		}
+		items = append(items, entry)
+	}
+	a.store.mu.RUnlock()
+
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{
+		"workers":         items,
+		"total":           len(items),
 		"stale_threshold": int(a.workerStatusStaleAfter.Seconds()),
 	}})
 }

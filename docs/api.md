@@ -58,6 +58,7 @@ https://api.hatchfarm.ai/v1
 | POST | /machines/{id}/certificate | Issue/rotate short-lived machine certificate (owner-auth + `X-Machine-Token` required) |
 | GET | /workers/{id}/policy | Worker policy fetch (requires machine token + certificate id) |
 | GET | /workers/{id}/status | Owner-auth worker runtime status (last heartbeat / policy / stale flag) |
+| GET | /workers/statuses | Owner-auth list of owned worker statuses (with stale/age summary) |
 | GET | /metrics | Basic Prometheus-style runtime metrics (auth required unless `METRICS_PUBLIC=true`) |
 | POST | /policies | Create signed policy draft (owner-auth required) |
 | POST | /policies/{id}/activate | Activate policy (owner-auth required) |

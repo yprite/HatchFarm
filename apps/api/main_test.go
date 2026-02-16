@@ -384,6 +384,56 @@ func TestWorkerStatusEndpoint(t *testing.T) {
 	}
 }
 
+func TestOwnerWorkerStatusesEndpoint(t *testing.T) {
+	app, h := newTestServer()
+	workerID, workerToken, workerCertID, policyID := setupWorkerConsent(t, h, app.apiToken)
+
+	ts := time.Now().UTC().Format(time.RFC3339)
+	nonce := "statuses-1"
+	sig := signHeartbeat(workerToken, workerID, ts, nonce, policyID)
+	w := doJSON(t, h, http.MethodPost, "/api/v1/workers/"+workerID+"/heartbeat", map[string]interface{}{
+		"timestamp": ts,
+		"nonce":     nonce,
+		"policy_id": policyID,
+		"signature": sig,
+	}, map[string]string{"X-Machine-Token": workerToken, "X-Machine-Certificate-Id": workerCertID})
+	if w.Code != http.StatusOK {
+		t.Fatalf("heartbeat expected 200, got %d", w.Code)
+	}
+
+	w = doJSON(t, h, http.MethodGet, "/api/v1/workers/statuses", nil, authHeader(app.apiToken))
+	if w.Code != http.StatusOK {
+		t.Fatalf("statuses expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Total   int `json:"total"`
+			Workers []struct {
+				WorkerID string `json:"worker_id"`
+				PolicyID string `json:"policy_id"`
+				Stale    bool   `json:"stale"`
+			} `json:"workers"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	if !resp.Success || resp.Data.Total < 1 {
+		t.Fatalf("unexpected statuses response")
+	}
+	found := false
+	for _, it := range resp.Data.Workers {
+		if it.WorkerID == workerID {
+			found = true
+			if it.PolicyID != policyID || it.Stale {
+				t.Fatalf("unexpected worker status item")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("target worker not present in statuses")
+	}
+}
+
 func TestWorkerStatusStaleFlag(t *testing.T) {
 	app, h := newTestServer()
 	app.workerStatusStaleAfter = 1 * time.Second
