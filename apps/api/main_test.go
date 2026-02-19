@@ -12,8 +12,10 @@ import (
 )
 
 func newTestServer() (*App, http.Handler) {
+	_ = os.Setenv("HATCHFARM_STATE_FILE", "")
 	app := newApp()
 	app.apiToken = "test-" + randomID(8)
+	app.stateFile = ""
 	app.workerStatusStateFile = ""
 	h := app.corsMiddleware(app.requestIDMiddleware(app.loggingMiddleware(app.tlsEnforcementMiddleware(app.bodyLimitMiddleware(app.rateLimitMiddleware(app.routes()))))))
 	return app, h
@@ -344,8 +346,17 @@ func TestMetricsEndpoint(t *testing.T) {
 		t.Fatalf("expected 200 with auth, got %d", w.Code)
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, "hatchfarm_uptime_seconds") {
-		t.Fatalf("unexpected metrics output: %s", body)
+	for _, key := range []string{
+		"hatchfarm_uptime_seconds",
+		"hatchfarm_workers_total",
+		"hatchfarm_workers_stale_total",
+		"hatchfarm_worker_auth_failures_total",
+		"hatchfarm_alert_stale_workers",
+		"hatchfarm_alert_worker_auth_failures",
+	} {
+		if !strings.Contains(body, key) {
+			t.Fatalf("missing metric %q in output: %s", key, body)
+		}
 	}
 }
 
@@ -580,37 +591,84 @@ func TestIssueMachineCertificateEndpoint(t *testing.T) {
 	}
 }
 
-func TestWorkerStatusStatePersistenceRoundtrip(t *testing.T) {
+func TestPersistentStateRoundtrip(t *testing.T) {
 	app, _ := newTestServer()
-	stateFile := t.TempDir() + "/worker-status.json"
-	app.workerStatusStateFile = stateFile
+	stateFile := t.TempDir() + "/state.json"
+	app.stateFile = stateFile
+	app.workerStatusStateFile = ""
 
 	now := time.Now().UTC()
 	app.store.mu.Lock()
+	app.store.machines["wrk_1"] = &Machine{ID: "wrk_1", OwnerID: "own_1", Name: "node-a", Secret: "s1", CreatedAt: now}
+	app.store.machineCerts["wrk_1"] = &MachineCertificate{CertificateID: "mcert_1", MachineID: "wrk_1", IssuedAt: now, ExpiresAt: now.Add(1 * time.Hour), Signature: "sig"}
+	app.store.policies["pol_1"] = &Policy{ID: "pol_1", OwnerID: "own_1", Version: 1, Rules: map[string]interface{}{"max_cpu_percent": 50.0}, Signature: "psig", State: "active", CreatedAt: now, UpdatedAt: now}
+	app.store.consents["con_1"] = &Consent{ID: "con_1", OwnerID: "own_1", WorkerID: "wrk_1", PolicyID: "pol_1", Signature: "csig", EffectiveAt: now}
 	app.store.workerStatus["wrk_1"] = &WorkerStatus{WorkerID: "wrk_1", LastHeartbeat: now, PolicyID: "pol_1", UpdatedAt: now}
+	app.store.auditEvents = append(app.store.auditEvents, &AuditEvent{ID: "aud_1", Type: "test", Actor: "owner:own_1", ObjectID: "wrk_1", CreatedAt: now})
 	app.store.mu.Unlock()
 
-	if err := app.saveWorkerStatusState(); err != nil {
-		t.Fatalf("save worker status: %v", err)
+	if err := app.savePersistentState(); err != nil {
+		t.Fatalf("save state: %v", err)
 	}
 
 	other, _ := newTestServer()
-	other.workerStatusStateFile = stateFile
-	if err := other.loadWorkerStatusState(); err != nil {
-		t.Fatalf("load worker status: %v", err)
+	other.stateFile = stateFile
+	other.workerStatusStateFile = ""
+	if err := other.loadPersistentState(); err != nil {
+		t.Fatalf("load state: %v", err)
 	}
 
 	other.store.mu.RLock()
 	defer other.store.mu.RUnlock()
-	got, ok := other.store.workerStatus["wrk_1"]
-	if !ok {
+	if got, ok := other.store.machines["wrk_1"]; !ok || got.Secret != "s1" {
+		t.Fatalf("expected persisted machine secret")
+	}
+	if _, ok := other.store.policies["pol_1"]; !ok {
+		t.Fatal("expected persisted policy")
+	}
+	if _, ok := other.store.consents["con_1"]; !ok {
+		t.Fatal("expected persisted consent")
+	}
+	if _, ok := other.store.workerStatus["wrk_1"]; !ok {
 		t.Fatal("expected persisted worker status")
 	}
-	if got.PolicyID != "pol_1" {
-		t.Fatalf("unexpected policy id: %s", got.PolicyID)
+	if len(other.store.auditEvents) == 0 {
+		t.Fatal("expected persisted audit event")
 	}
 	if _, err := os.Stat(stateFile); err != nil {
 		t.Fatalf("expected state file to exist: %v", err)
+	}
+}
+
+func TestMetricsAuthFailureAlertThreshold(t *testing.T) {
+	app, h := newTestServer()
+	app.authFailAlertThreshold = 2
+	app.authFailAlertWindow = 60 * time.Second
+
+	workerID, _, workerCertID, policyID := setupWorkerConsent(t, h, app.apiToken)
+
+	for i := 0; i < 2; i++ {
+		w := doJSON(t, h, http.MethodPost, "/api/v1/workers/"+workerID+"/heartbeat", map[string]interface{}{
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"nonce":     "bad-auth-" + randomID(4),
+			"policy_id": policyID,
+			"signature": "bad-signature",
+		}, map[string]string{"X-Machine-Token": "wrong-token", "X-Machine-Certificate-Id": workerCertID})
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for bad auth heartbeat, got %d", w.Code)
+		}
+	}
+
+	mw := doJSON(t, h, http.MethodGet, "/metrics", nil, map[string]string{"Authorization": "Bearer " + app.apiToken})
+	if mw.Code != http.StatusOK {
+		t.Fatalf("metrics expected 200, got %d", mw.Code)
+	}
+	body := mw.Body.String()
+	if !strings.Contains(body, "hatchfarm_worker_auth_failures_total 2") {
+		t.Fatalf("expected total auth failures metric, got: %s", body)
+	}
+	if !strings.Contains(body, "hatchfarm_alert_worker_auth_failures 1") {
+		t.Fatalf("expected auth failure alert metric to be 1, got: %s", body)
 	}
 }
 

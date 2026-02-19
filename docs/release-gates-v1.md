@@ -59,15 +59,25 @@ A release can ship only if **all gates pass**.
 
 ---
 
-## Operational Gate — Reliability
+## Operational Gate — Reliability + Observability
 ### Mandatory Checks
 - [ ] SLO dashboards healthy for pre-release window
 - [ ] Alert routes tested (on-call paging)
 - [ ] Rollback plan rehearsed for this release
 - [ ] Error budget consumption within policy
+- [ ] `/metrics` exposes fleet freshness and auth failure primitives:
+  - [ ] `hatchfarm_workers_total`
+  - [ ] `hatchfarm_workers_stale_total`
+  - [ ] `hatchfarm_worker_auth_failures_total`
+  - [ ] `hatchfarm_worker_auth_failures_recent`
+- [ ] Alert primitives are wired and verified in pre-release soak:
+  - [ ] `hatchfarm_alert_stale_workers` fires when stale workers > 0
+  - [ ] `hatchfarm_alert_worker_auth_failures` fires when recent auth failures exceed threshold
+- [ ] On-call runbook includes stale-worker and auth-failure triage links
 
 ### Owners
 - Platform SRE Lead (required)
+- API Runtime Lead (required)
 
 ---
 
@@ -77,6 +87,7 @@ A release can ship only if **all gates pass**.
 - Reconciliation mismatch above threshold
 - Missing signed artifact/provenance
 - Red team veto not resolved
+- Missing observability evidence for stale worker/auth failure alerts
 
 ---
 

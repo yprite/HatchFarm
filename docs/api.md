@@ -43,9 +43,14 @@ https://api.hatchfarm.ai/v1
   - `REDIS_RATE_LIMIT_WINDOW_SECONDS` (default `1`)
   - `REDIS_RATE_LIMIT_MAX_REQUESTS` (default `20`)
   - `REDIS_RATE_LIMIT_FALLBACK` (default `true`): if Redis limiter fails, fallback to local limiter
-- Worker status persistence:
-  - `WORKER_STATUS_STATE_FILE` (default `.worker_status_state.json`) persists worker heartbeat status across API restarts
+- Durable API state persistence:
+  - `HATCHFARM_STATE_FILE` (default disabled) stores durable API control-plane state as a versioned JSON snapshot (machines, machine certificates, policies, consents, worker status, audit events)
+  - Snapshot writes are atomic (`.tmp` + rename) to reduce partial-write risk
+  - Legacy worker-only persistence remains available via `WORKER_STATUS_STATE_FILE` (default `.worker_status_state.json`) for migration compatibility
   - `WORKER_STATUS_STALE_SECONDS` (default `60`) controls stale-status threshold in `/workers/{id}/status`
+- Worker auth-failure alert primitives:
+  - `WORKER_AUTH_FAIL_ALERT_WINDOW_SECONDS` (default `300`) controls recent auth-failure lookback window used in metrics
+  - `WORKER_AUTH_FAIL_ALERT_THRESHOLD` (default `10`) controls when `hatchfarm_alert_worker_auth_failures` flips to `1`
 
 ---
 
@@ -61,7 +66,7 @@ https://api.hatchfarm.ai/v1
 | GET | /workers/{id}/status | Owner-auth worker runtime status (last heartbeat / policy / stale flag) |
 | GET | /workers/summary | Owner-auth fleet summary (`total/fresh/stale/unknown`) |
 | GET | /workers/statuses | Owner-auth list of owned worker statuses (with stale/age summary, supports `limit`/`offset`) |
-| GET | /metrics | Basic Prometheus-style runtime metrics (auth required unless `METRICS_PUBLIC=true`) |
+| GET | /metrics | Prometheus-style runtime + observability primitives (auth required unless `METRICS_PUBLIC=true`) |
 | POST | /policies | Create signed policy draft (owner-auth required) |
 | POST | /policies/{id}/activate | Activate policy (owner-auth required) |
 | POST | /consents | Create consent binding owner+worker+policy (owner-auth required) |
@@ -124,3 +129,18 @@ https://api.hatchfarm.ai/v1
 | 404 | Not Found |
 | 429 | Rate Limited |
 | 500 | Server Error |
+
+
+### Metrics (current baseline)
+
+`/metrics` currently exposes:
+
+- `hatchfarm_uptime_seconds`
+- `hatchfarm_workers_total`
+- `hatchfarm_workers_stale_total`
+- `hatchfarm_workers_unknown_total`
+- `hatchfarm_worker_auth_failures_total`
+- `hatchfarm_worker_auth_failures_recent`
+- `hatchfarm_worker_auth_failures_by_reason_total{reason="..."}`
+- `hatchfarm_alert_stale_workers` (0/1)
+- `hatchfarm_alert_worker_auth_failures` (0/1)

@@ -143,8 +143,15 @@ type App struct {
 	redisRateLimitWindow   time.Duration
 	redisRateLimitMax      int
 	metricsPublic          bool
+	stateFile              string
 	workerStatusStateFile  string
 	workerStatusStaleAfter time.Duration
+	workerAuthFailMu       sync.Mutex
+	workerAuthFailTotal    int
+	workerAuthFailByReason map[string]int
+	workerAuthFailEvents   []time.Time
+	authFailAlertWindow    time.Duration
+	authFailAlertThreshold int
 }
 
 func main() {
@@ -182,7 +189,7 @@ func main() {
 	if err := server.Shutdown(ctx); err != nil {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
-	if err := app.saveWorkerStatusState(); err != nil {
+	if err := app.savePersistentState(); err != nil {
 		log.Printf("warning: failed to save worker status state on shutdown: %v", err)
 	}
 
@@ -228,12 +235,16 @@ func newApp() *App {
 		redisRateLimitWindow:   time.Duration(envIntOrDefault("REDIS_RATE_LIMIT_WINDOW_SECONDS", 1)) * time.Second,
 		redisRateLimitMax:      envIntOrDefault("REDIS_RATE_LIMIT_MAX_REQUESTS", int(rateLimitBurst)),
 		metricsPublic:          strings.EqualFold(envOrDefault("METRICS_PUBLIC", "false"), "true"),
+		stateFile:              strings.TrimSpace(os.Getenv("HATCHFARM_STATE_FILE")),
 		workerStatusStateFile:  envOrDefault("WORKER_STATUS_STATE_FILE", ".worker_status_state.json"),
 		workerStatusStaleAfter: time.Duration(envIntOrDefault("WORKER_STATUS_STALE_SECONDS", 60)) * time.Second,
+		workerAuthFailByReason: map[string]int{},
+		authFailAlertWindow:    time.Duration(envIntOrDefault("WORKER_AUTH_FAIL_ALERT_WINDOW_SECONDS", 300)) * time.Second,
+		authFailAlertThreshold: envIntOrDefault("WORKER_AUTH_FAIL_ALERT_THRESHOLD", 10),
 	}
 	app.redisClient = initRedisClient()
-	if err := app.loadWorkerStatusState(); err != nil {
-		log.Printf("warning: failed to load worker status state: %v", err)
+	if err := app.loadPersistentState(); err != nil {
+		log.Printf("warning: failed to load persisted state: %v", err)
 	}
 	return app
 }
@@ -322,8 +333,30 @@ func (a *App) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	uptime := time.Since(a.startedAt).Seconds()
+	totalWorkers, staleWorkers, unknownWorkers := a.workerFleetSnapshot()
+	authFailTotal, authFailRecent, authFailByReason := a.workerAuthFailureSnapshot()
+
+	staleWorkerAlert := 0
+	if staleWorkers > 0 {
+		staleWorkerAlert = 1
+	}
+	authFailureAlert := 0
+	if authFailRecent >= a.authFailAlertThreshold {
+		authFailureAlert = 1
+	}
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	_, _ = fmt.Fprintf(w, "hatchfarm_uptime_seconds %.0f\n", uptime)
+	_, _ = fmt.Fprintf(w, "hatchfarm_workers_total %d\n", totalWorkers)
+	_, _ = fmt.Fprintf(w, "hatchfarm_workers_stale_total %d\n", staleWorkers)
+	_, _ = fmt.Fprintf(w, "hatchfarm_workers_unknown_total %d\n", unknownWorkers)
+	_, _ = fmt.Fprintf(w, "hatchfarm_worker_auth_failures_total %d\n", authFailTotal)
+	_, _ = fmt.Fprintf(w, "hatchfarm_worker_auth_failures_recent %d\n", authFailRecent)
+	for reason, count := range authFailByReason {
+		_, _ = fmt.Fprintf(w, "hatchfarm_worker_auth_failures_by_reason_total{reason=%q} %d\n", reason, count)
+	}
+	_, _ = fmt.Fprintf(w, "hatchfarm_alert_stale_workers %d\n", staleWorkerAlert)
+	_, _ = fmt.Fprintf(w, "hatchfarm_alert_worker_auth_failures %d\n", authFailureAlert)
 }
 
 func (a *App) machineHandler(w http.ResponseWriter, r *http.Request) {
@@ -371,6 +404,11 @@ func (a *App) registerMachineHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	a.appendAuditLocked("machine_registered", "owner:"+req.OwnerID, id, map[string]interface{}{"name": req.Name})
 	a.store.mu.Unlock()
+	if err := a.savePersistentState(); err != nil {
+		log.Printf("warning: failed to persist state: %v", err)
+		writeError(w, http.StatusInternalServerError, "state persistence failed")
+		return
+	}
 
 	writeJSON(w, http.StatusCreated, APIResponse{Success: true, Data: map[string]interface{}{"machine": m, "machine_token": secret, "machine_certificate": cert}})
 }
@@ -426,6 +464,11 @@ func (a *App) issueMachineCertificateHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	a.appendAuditLocked("machine_certificate_issued", "owner:"+ownerID, machineID, map[string]interface{}{"certificate_id": cert.CertificateID})
+	if err := a.savePersistentState(); err != nil {
+		log.Printf("warning: failed to persist state: %v", err)
+		writeError(w, http.StatusInternalServerError, "state persistence failed")
+		return
+	}
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: cert})
 }
 
@@ -514,6 +557,11 @@ func (a *App) createPolicyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	a.store.policies[id] = policy
 	a.appendAuditLocked("policy_created", "owner:"+req.OwnerID, id, map[string]interface{}{"version": policy.Version})
+	if err := a.savePersistentState(); err != nil {
+		log.Printf("warning: failed to persist state: %v", err)
+		writeError(w, http.StatusInternalServerError, "state persistence failed")
+		return
+	}
 
 	writeJSON(w, http.StatusCreated, APIResponse{Success: true, Data: policy})
 }
@@ -552,6 +600,11 @@ func (a *App) activatePolicyHandler(w http.ResponseWriter, r *http.Request) {
 	policy.State = "active"
 	policy.UpdatedAt = time.Now().UTC()
 	a.appendAuditLocked("policy_activated", "owner:"+policy.OwnerID, id, map[string]interface{}{"version": policy.Version})
+	if err := a.savePersistentState(); err != nil {
+		log.Printf("warning: failed to persist state: %v", err)
+		writeError(w, http.StatusInternalServerError, "state persistence failed")
+		return
+	}
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: policy})
 }
 
@@ -607,6 +660,11 @@ func (a *App) createConsentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	a.store.consents[consent.ID] = consent
 	a.appendAuditLocked("consent_created", "owner:"+req.OwnerID, consent.ID, map[string]interface{}{"worker_id": req.WorkerID, "policy_id": req.PolicyID})
+	if err := a.savePersistentState(); err != nil {
+		log.Printf("warning: failed to persist state: %v", err)
+		writeError(w, http.StatusInternalServerError, "state persistence failed")
+		return
+	}
 	writeJSON(w, http.StatusCreated, APIResponse{Success: true, Data: consent})
 }
 
@@ -664,6 +722,11 @@ func (a *App) revokeConsentHandler(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	consent.RevokedAt = &now
 	a.appendAuditLocked("consent_revoked", "owner:"+consent.OwnerID, id, map[string]interface{}{"worker_id": consent.WorkerID})
+	if err := a.savePersistentState(); err != nil {
+		log.Printf("warning: failed to persist state: %v", err)
+		writeError(w, http.StatusInternalServerError, "state persistence failed")
+		return
+	}
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: consent})
 }
 
@@ -822,8 +885,10 @@ func (a *App) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	a.appendAuditLocked("worker_heartbeat", "worker:"+workerID, workerID, map[string]interface{}{"policy_id": req.PolicyID})
 	a.store.mu.Unlock()
-	if err := a.saveWorkerStatusState(); err != nil {
-		log.Printf("warning: failed to persist worker status: %v", err)
+	if err := a.savePersistentState(); err != nil {
+		log.Printf("warning: failed to persist state: %v", err)
+		writeError(w, http.StatusInternalServerError, "state persistence failed")
+		return
 	}
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"worker_id": workerID, "accepted": true}})
 }
@@ -1163,15 +1228,80 @@ func (a *App) appendAuditLocked(eventType, actor, objectID string, metadata map[
 }
 
 func (a *App) auditWorkerAuthFailure(workerID, reason string) {
+	a.recordWorkerAuthFailure(reason)
 	a.store.mu.Lock()
-	defer a.store.mu.Unlock()
 	a.appendAuditLocked("worker_auth_failed", "worker:"+workerID, workerID, map[string]interface{}{"reason": reason})
+	a.store.mu.Unlock()
+	if err := a.savePersistentState(); err != nil {
+		log.Printf("warning: failed to persist state: %v", err)
+	}
+}
+
+func (a *App) recordWorkerAuthFailure(reason string) {
+	now := time.Now().UTC()
+	a.workerAuthFailMu.Lock()
+	defer a.workerAuthFailMu.Unlock()
+	a.workerAuthFailTotal++
+	a.workerAuthFailByReason[reason]++
+	a.workerAuthFailEvents = append(a.workerAuthFailEvents, now)
+	a.cleanupWorkerAuthFailEventsLocked(now)
+}
+
+func (a *App) cleanupWorkerAuthFailEventsLocked(now time.Time) {
+	if len(a.workerAuthFailEvents) == 0 {
+		return
+	}
+	cutoff := now.Add(-a.authFailAlertWindow)
+	idx := 0
+	for idx < len(a.workerAuthFailEvents) && a.workerAuthFailEvents[idx].Before(cutoff) {
+		idx++
+	}
+	if idx > 0 {
+		a.workerAuthFailEvents = append([]time.Time(nil), a.workerAuthFailEvents[idx:]...)
+	}
+}
+
+func (a *App) workerAuthFailureSnapshot() (total int, recent int, byReason map[string]int) {
+	now := time.Now().UTC()
+	a.workerAuthFailMu.Lock()
+	defer a.workerAuthFailMu.Unlock()
+	a.cleanupWorkerAuthFailEventsLocked(now)
+	byReason = make(map[string]int, len(a.workerAuthFailByReason))
+	for reason, count := range a.workerAuthFailByReason {
+		byReason[reason] = count
+	}
+	return a.workerAuthFailTotal, len(a.workerAuthFailEvents), byReason
+}
+
+func (a *App) workerFleetSnapshot() (total, stale, unknown int) {
+	now := time.Now().UTC()
+	a.store.mu.RLock()
+	defer a.store.mu.RUnlock()
+	for workerID := range a.store.machines {
+		total++
+		status, ok := a.store.workerStatus[workerID]
+		if !ok {
+			unknown++
+			continue
+		}
+		age := now.Sub(status.LastHeartbeat)
+		if age < 0 {
+			age = 0
+		}
+		if age > a.workerStatusStaleAfter {
+			stale++
+		}
+	}
+	return total, stale, unknown
 }
 
 func (a *App) auditOwnerAction(ownerID, objectID, eventType, reason string) {
 	a.store.mu.Lock()
-	defer a.store.mu.Unlock()
 	a.appendAuditLocked(eventType, "owner:"+ownerID, objectID, map[string]interface{}{"reason": reason})
+	a.store.mu.Unlock()
+	if err := a.savePersistentState(); err != nil {
+		log.Printf("warning: failed to persist state: %v", err)
+	}
 }
 
 func (a *App) saveWorkerStatusState() error {
