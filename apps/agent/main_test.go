@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -47,5 +49,31 @@ func TestAgentStateRoundtrip(t *testing.T) {
 	}
 	if loaded.MachineID != s.MachineID || loaded.MachineCertID != s.MachineCertID {
 		t.Fatal("state mismatch")
+	}
+}
+
+func TestShouldAttempt(t *testing.T) {
+	now := time.Now().UTC()
+	if !shouldAttempt(time.Time{}, 10*time.Second, now) {
+		t.Fatal("zero last attempt should allow")
+	}
+	if shouldAttempt(now.Add(-5*time.Second), 10*time.Second, now) {
+		t.Fatal("attempt should be blocked by min interval")
+	}
+	if !shouldAttempt(now.Add(-11*time.Second), 10*time.Second, now) {
+		t.Fatal("attempt should be allowed after min interval")
+	}
+}
+
+func TestMaybeRunHook(t *testing.T) {
+	outFile := filepath.Join(t.TempDir(), "hook.out")
+	cfg := AgentConfig{HookCommand: "printf '%s:%s' \"$AGENT_HOOK_EVENT\" \"$AGENT_HOOK_MACHINE_ID\" > \"" + outFile + "\""}
+	maybeRunHook(cfg, "cert_rotated", map[string]string{"machine_id": "wrk_123"})
+	b, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("expected hook output: %v", err)
+	}
+	if string(b) != "cert_rotated:wrk_123" {
+		t.Fatalf("unexpected hook output: %s", string(b))
 	}
 }

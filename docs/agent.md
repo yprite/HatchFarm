@@ -14,6 +14,10 @@
 - `AGENT_WORKER_NAME` (default: `agent-node`)
 - `AGENT_HEARTBEAT_SECONDS` (default: `15`)
 - `AGENT_STATE_FILE` (default: `.agent_state.json`)
+- `AGENT_STALE_AFTER_SECONDS` (default: `120`) heartbeat staleness threshold for hook emission
+- `AGENT_HOOK_COMMAND` (optional) shell command executed for resilience hooks (`cert_rotated`, `policy_refreshed`, `heartbeat_stale`)
+- `AGENT_POLICY_REFRESH_MIN_SECONDS` (default: `10`) minimum interval between policy refresh retries after 403
+- `AGENT_CERT_ROTATE_MIN_SECONDS` (default: `30`) minimum interval between cert rotation retries after 401
 
 ## Run
 
@@ -31,7 +35,9 @@ go run .
   - HTTP client timeout (10s)
   - machine register retry with exponential backoff
   - heartbeat retry backoff with capped consecutive failure exit
-  - on worker auth failure (401), cert rotation is attempted and heartbeat is retried once
-  - on consent/policy mismatch (403), worker policy is re-fetched and heartbeat retried with latest active policy
-  - local state persistence/reuse across restarts (`AGENT_STATE_FILE`)
-- This is an evolving Sprint 2 runtime loop; attestation and update orchestration are planned next.
+  - 401 certificate-rotation retry path with minimum retry interval guard (prevents rotate storms)
+  - 403 policy refresh retry path with minimum retry interval guard (prevents fetch storms)
+  - stale heartbeat detection hook (`heartbeat_stale`) for external alerting/integration
+  - cert/policy rotation hooks (`cert_rotated`, `policy_refreshed`) for automation integrations
+  - atomic local state persistence/reuse across restarts (`AGENT_STATE_FILE`) to avoid partial/corrupt writes
+- This is an evolving Sprint 3 hardening runtime loop; attestation and update orchestration are planned next.

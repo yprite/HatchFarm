@@ -13,7 +13,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -24,25 +27,33 @@ const (
 	registerBackoffBase          = 2 * time.Second
 	heartbeatFailBackoffCap      = 60 * time.Second
 	heartbeatMaxConsecutiveFails = 15
+	certRotateMinInterval        = 30 * time.Second
+	policyRefreshMinInterval     = 10 * time.Second
 )
 
 type AgentConfig struct {
-	APIBaseURL       string
-	OwnerToken       string
-	OwnerID          string
-	WorkerName       string
-	PolicyID         string
-	HeartbeatSeconds int
-	StateFile        string
+	APIBaseURL              string
+	OwnerToken              string
+	OwnerID                 string
+	WorkerName              string
+	PolicyID                string
+	HeartbeatSeconds        int
+	StateFile               string
+	StaleAfterSeconds       int
+	HookCommand             string
+	PolicyRefreshMinSeconds int
+	CertRotateMinSeconds    int
 }
 
 type AgentState struct {
-	MachineID      string    `json:"machine_id"`
-	MachineToken   string    `json:"machine_token"`
-	MachineCertID  string    `json:"machine_certificate_id"`
-	PolicyID       string    `json:"policy_id"`
-	PolicySyncedAt time.Time `json:"policy_synced_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	MachineID         string    `json:"machine_id"`
+	MachineToken      string    `json:"machine_token"`
+	MachineCertID     string    `json:"machine_certificate_id"`
+	PolicyID          string    `json:"policy_id"`
+	PolicySyncedAt    time.Time `json:"policy_synced_at"`
+	LastHeartbeatAt   time.Time `json:"last_heartbeat_at,omitempty"`
+	LastPolicyCheckAt time.Time `json:"last_policy_check_at,omitempty"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type RegisterResponse struct {
@@ -156,31 +167,49 @@ func main() {
 	}
 	currentPolicyID := policySnapshot.PolicyID
 	currentPolicySyncedAt := policySnapshot.EffectiveAt
+	now := time.Now().UTC()
 	if currentPolicySyncedAt.IsZero() {
-		currentPolicySyncedAt = time.Now().UTC()
+		currentPolicySyncedAt = now
 	}
 	if loaded && state.PolicySyncedAt.After(currentPolicySyncedAt) {
 		currentPolicySyncedAt = state.PolicySyncedAt
 	}
-	if err := saveState(cfg.StateFile, AgentState{
-		MachineID:      machineID,
-		MachineToken:   machineToken,
-		MachineCertID:  machineCertID,
-		PolicyID:       currentPolicyID,
-		PolicySyncedAt: currentPolicySyncedAt,
-		UpdatedAt:      time.Now().UTC(),
-	}); err != nil {
-		log.Printf("warning: failed to persist agent state: %v", err)
+	lastHeartbeatAt := state.LastHeartbeatAt
+	lastPolicyCheckAt := state.LastPolicyCheckAt
+	persist := func() {
+		if err := saveState(cfg.StateFile, AgentState{
+			MachineID:         machineID,
+			MachineToken:      machineToken,
+			MachineCertID:     machineCertID,
+			PolicyID:          currentPolicyID,
+			PolicySyncedAt:    currentPolicySyncedAt,
+			LastHeartbeatAt:   lastHeartbeatAt,
+			LastPolicyCheckAt: lastPolicyCheckAt,
+			UpdatedAt:         time.Now().UTC(),
+		}); err != nil {
+			log.Printf("warning: failed to persist agent state: %v", err)
+		}
 	}
+	persist()
 
 	heartbeatInterval := time.Duration(cfg.HeartbeatSeconds) * time.Second
 	if heartbeatInterval <= 0 {
 		heartbeatInterval = 15 * time.Second
 	}
+	staleAfter := time.Duration(cfg.StaleAfterSeconds) * time.Second
+	if staleAfter <= 0 {
+		staleAfter = 2 * heartbeatInterval
+	}
+	certRotateMin := time.Duration(cfg.CertRotateMinSeconds) * time.Second
+	policyRefreshMin := time.Duration(cfg.PolicyRefreshMinSeconds) * time.Second
+
 	timer := time.NewTimer(heartbeatInterval)
 	defer timer.Stop()
 
 	consecutiveFails := 0
+	lastCertRotateAttempt := time.Time{}
+	lastPolicyRefreshAttempt := time.Time{}
+	staleHookFired := false
 
 	for {
 		select {
@@ -189,30 +218,34 @@ func main() {
 			return
 		case <-timer.C:
 			nextDelay := heartbeatInterval
+			now = time.Now().UTC()
 			err := sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID, currentPolicyID)
-			if apiErr, ok := err.(*apiCallError); ok && apiErr.Status == http.StatusUnauthorized {
+			if apiErr, ok := err.(*apiCallError); ok && apiErr.Status == http.StatusUnauthorized && shouldAttempt(lastCertRotateAttempt, certRotateMin, now) {
+				lastCertRotateAttempt = now
 				newCertID, certErr := rotateMachineCertificate(ctx, client, cfg, machineID, machineToken)
 				if certErr == nil {
 					machineCertID = newCertID
+					maybeRunHook(cfg, "cert_rotated", map[string]string{"machine_id": machineID, "certificate_id": machineCertID})
+					persist()
 					err = sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID, currentPolicyID)
-					if err == nil {
-						if saveErr := saveState(cfg.StateFile, AgentState{MachineID: machineID, MachineToken: machineToken, MachineCertID: machineCertID, PolicyID: currentPolicyID, PolicySyncedAt: currentPolicySyncedAt, UpdatedAt: time.Now().UTC()}); saveErr != nil {
-							log.Printf("warning: failed to persist rotated cert state: %v", saveErr)
-						}
-					}
 				}
 			}
-			if apiErr, ok := err.(*apiCallError); ok && apiErr.Status == http.StatusForbidden {
+			if apiErr, ok := err.(*apiCallError); ok && apiErr.Status == http.StatusForbidden && shouldAttempt(lastPolicyRefreshAttempt, policyRefreshMin, now) {
+				lastPolicyRefreshAttempt = now
 				latestPolicy, policyErr := fetchWorkerPolicy(ctx, client, cfg, machineID, machineToken, machineCertID)
-				if policyErr == nil && latestPolicy.PolicyID != "" && latestPolicy.EffectiveAt.After(currentPolicySyncedAt) {
-					currentPolicyID = latestPolicy.PolicyID
-					currentPolicySyncedAt = latestPolicy.EffectiveAt
-					err = sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID, currentPolicyID)
-					if err == nil {
-						if saveErr := saveState(cfg.StateFile, AgentState{MachineID: machineID, MachineToken: machineToken, MachineCertID: machineCertID, PolicyID: currentPolicyID, PolicySyncedAt: currentPolicySyncedAt, UpdatedAt: time.Now().UTC()}); saveErr != nil {
-							log.Printf("warning: failed to persist updated policy state: %v", saveErr)
+				if policyErr == nil && latestPolicy.PolicyID != "" {
+					lastPolicyCheckAt = now
+					if latestPolicy.EffectiveAt.After(currentPolicySyncedAt) || latestPolicy.PolicyID != currentPolicyID {
+						currentPolicyID = latestPolicy.PolicyID
+						if latestPolicy.EffectiveAt.IsZero() {
+							currentPolicySyncedAt = now
+						} else {
+							currentPolicySyncedAt = latestPolicy.EffectiveAt
 						}
+						maybeRunHook(cfg, "policy_refreshed", map[string]string{"machine_id": machineID, "policy_id": currentPolicyID})
+						persist()
 					}
+					err = sendHeartbeat(ctx, client, cfg, machineID, machineToken, machineCertID, currentPolicyID)
 				}
 			}
 			if err != nil {
@@ -221,12 +254,19 @@ func main() {
 					log.Fatalf("heartbeat failed %d times consecutively, exiting: %v", consecutiveFails, err)
 				}
 				nextDelay = heartbeatFailureBackoff(consecutiveFails)
+				if !lastHeartbeatAt.IsZero() && now.Sub(lastHeartbeatAt) >= staleAfter && !staleHookFired {
+					staleHookFired = true
+					maybeRunHook(cfg, "heartbeat_stale", map[string]string{"machine_id": machineID, "age_seconds": fmt.Sprintf("%d", int(now.Sub(lastHeartbeatAt).Seconds()))})
+				}
 				log.Printf("heartbeat error (streak=%d): %v; next_retry=%s", consecutiveFails, err, nextDelay)
 			} else {
 				if consecutiveFails > 0 {
 					log.Printf("heartbeat recovered after %d failures", consecutiveFails)
 				}
 				consecutiveFails = 0
+				lastHeartbeatAt = now
+				staleHookFired = false
+				persist()
 				log.Printf("heartbeat ok machine_id=%s", machineID)
 			}
 			timer.Reset(nextDelay)
@@ -236,13 +276,17 @@ func main() {
 
 func loadConfig() AgentConfig {
 	return AgentConfig{
-		APIBaseURL:       envOrDefault("AGENT_API_BASE_URL", "http://localhost:8080"),
-		OwnerToken:       os.Getenv("AGENT_OWNER_TOKEN"),
-		OwnerID:          os.Getenv("AGENT_OWNER_ID"),
-		WorkerName:       envOrDefault("AGENT_WORKER_NAME", "agent-node"),
-		PolicyID:         os.Getenv("AGENT_POLICY_ID"),
-		HeartbeatSeconds: envIntOrDefault("AGENT_HEARTBEAT_SECONDS", 15),
-		StateFile:        envOrDefault("AGENT_STATE_FILE", ".agent_state.json"),
+		APIBaseURL:              envOrDefault("AGENT_API_BASE_URL", "http://localhost:8080"),
+		OwnerToken:              os.Getenv("AGENT_OWNER_TOKEN"),
+		OwnerID:                 os.Getenv("AGENT_OWNER_ID"),
+		WorkerName:              envOrDefault("AGENT_WORKER_NAME", "agent-node"),
+		PolicyID:                os.Getenv("AGENT_POLICY_ID"),
+		HeartbeatSeconds:        envIntOrDefault("AGENT_HEARTBEAT_SECONDS", 15),
+		StateFile:               envOrDefault("AGENT_STATE_FILE", ".agent_state.json"),
+		StaleAfterSeconds:       envIntOrDefault("AGENT_STALE_AFTER_SECONDS", 120),
+		HookCommand:             strings.TrimSpace(os.Getenv("AGENT_HOOK_COMMAND")),
+		PolicyRefreshMinSeconds: envIntOrDefault("AGENT_POLICY_REFRESH_MIN_SECONDS", int(policyRefreshMinInterval.Seconds())),
+		CertRotateMinSeconds:    envIntOrDefault("AGENT_CERT_ROTATE_MIN_SECONDS", int(certRotateMinInterval.Seconds())),
 	}
 }
 
@@ -451,7 +495,58 @@ func saveState(path string, s AgentState) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o600)
+	dir := filepath.Dir(path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	tmp, err := os.CreateTemp(dir, ".agent-state-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func shouldAttempt(last time.Time, minInterval time.Duration, now time.Time) bool {
+	if last.IsZero() {
+		return true
+	}
+	return now.Sub(last) >= minInterval
+}
+
+func maybeRunHook(cfg AgentConfig, event string, fields map[string]string) {
+	if cfg.HookCommand == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", cfg.HookCommand)
+	env := append(os.Environ(), "AGENT_HOOK_EVENT="+event)
+	for k, v := range fields {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		env = append(env, "AGENT_HOOK_"+strings.ToUpper(k)+"="+v)
+	}
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("warning: hook command failed event=%s err=%v output=%s", event, err, strings.TrimSpace(string(out)))
+	}
 }
 
 func randomID(size int) string {
